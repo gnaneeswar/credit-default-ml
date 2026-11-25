@@ -9,6 +9,7 @@ module prefixes, and stored in the MLmodel file so the serving side loads it unc
 from __future__ import annotations
 
 import importlib.metadata
+import time
 
 import pandas as pd
 from sklearn.pipeline import Pipeline
@@ -53,6 +54,7 @@ def log_and_register(
     from mlflow import MlflowClient
     from mlflow.models import infer_signature
 
+    t0 = time.perf_counter()
     model = best.best_estimator
     # Raw canonical columns, as the API receives them (before feature engineering).
     example = X_train.head(5)
@@ -66,7 +68,8 @@ def log_and_register(
         pip_requirements=_pip_requirements(),
         metadata={THRESHOLD_TAG: choice.threshold, "model_family": best.spec.family},
     )
-    log.info("logged model %s (%s)", info.model_uri, best.spec.name)
+    t1 = time.perf_counter()
+    log.info("logged model %s (%s) in %.1fs", info.model_uri, best.spec.name, t1 - t0)
 
     mv = mlflow.register_model(info.model_uri, settings.model_name)
     client = MlflowClient()
@@ -95,10 +98,11 @@ def log_and_register(
     )
     client.set_registered_model_alias(settings.model_name, settings.model_alias, mv.version)
     log.info(
-        "registered %s version %s and set alias @%s (threshold=%.4f)",
+        "registered %s version %s and set alias @%s (threshold=%.4f) in %.1fs",
         settings.model_name,
         mv.version,
         settings.model_alias,
         choice.threshold,
+        time.perf_counter() - t1,
     )
     return str(mv.version)

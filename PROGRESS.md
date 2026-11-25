@@ -9,12 +9,15 @@ Plan: leak-free credit-default pipeline (UCI 350) → MLflow registry `@champion
 - [x] P3 Training — 4-model GridSearchCV (3-fold), OOF decile threshold, registry `@champion`, holdout eval (<45s)
 - [x] P4 Serving — FastAPI `/health` + `/invocations` (dataframe_split), batch client (drops target col)
 - [x] P5 Monitoring — Evidently drift + classification scenarios, report html + summary json
-- [ ] P6 Docker + README + push — Dockerfile.train/serve, compose, sample_request.json, Design Decisions
+- [x] P6 Docker + README + push — Dockerfile.train/serve, compose, sample_request.json, Design Decisions
 
 ## Next steps
-- P6: give user the sudo block for Docker Engine (docker-ce, cli, containerd.io, buildx, compose plugin; usermod -aG docker). Dockerfile.train / Dockerfile.serve (python:3.12-slim-bookworm linux/amd64, pinned uv, apt libgomp1, `uv sync --frozen --no-dev --no-install-project`, ENV PATH=/app/.venv/bin HOME=/tmp MPLCONFIGDIR USER/LOGNAME, WORKDIR /app, CMD python/uvicorn directly). Serve copies only src/common, src/features, src/inference. docker-compose.yml (train -> serve, service_completed_successfully, ./mlruns + ./artifacts bind mounts, user UID:GID). .dockerignore. README (business, architecture, Design Decisions 1-5 incl. SEX fairness + flat-F1 cutoff honesty, run/verify/cleanup). Verify clean compose + sequential runs; time train container; push.
+- All phases complete. Optional follow-ups (README §11): cost-based threshold, calibration, SEX fairness audit/drop, champion/challenger promotion gate, train/serve dependency groups for a leaner serve image.
 
 ## Open issues / notes
+- P6 verified on Docker 29.10.1 / Compose v5.8: clean `docker compose up --build` (train exit 0 → serve healthy; curl + `--profile score` batch F1 0.5379 identical to host) and README Option B verbatim. Pipeline 41-45s in container, ~50-52s container wall (≈5s fixed start/exit). Images 2.47 GB (shared layers), train peak 2.93 GiB RAM (12 workers), serve ~290 MB. Serve image has no data/ or src/training. Outputs owned by host UID 1000.
+- Docker access in this session came from `setfacl -m u:$USER:rw /var/run/docker.sock` (resets on docker restart; a fresh login picks up the docker group permanently).
+- `mlruns/.gitkeep` committed (like artifacts/) so bind-mount dirs exist user-owned on clone; `git clean -fdX mlruns artifacts` resets outputs.
 - P5 results: holdout drift 0.00, F1 0.538 (Δ-0.008) no alerts; covariate_drift share 0.57 (13 cols: LIMIT_BAL, PAY_*, BILL_AMT*; PAY_AMT* untouched) F1 0.399 → drift+perf alerts; concept_drift (30% labels flipped) drift 0.00, F1 0.404 → perf alert only (argument for label monitoring). Alert policy: drift share >= 0.25, F1/accuracy drop > 0.05 vs OOF reference.
 - pandas pinned <3: evidently 0.7.23 imports pandas internals removed in pandas 3 (its own dev stubs pin pandas<3).
 - Runtime work (full 5-stage run now 38-41s pipeline / 43-45s wall at loadavg 3-5): MLflow init in background thread overlapping searches; GridSearchCV refit=False + one parallel batch (winner refit w/ spare cores then n_jobs reset to 1, 3 OOF folds, LR refit for IV); monitoring = 3 Evidently reports in a spawn ProcessPool pre-warmed (import evidently ~4.7s) right after searches. Threads don't help Evidently (GIL-bound, measured). Results bit-identical.

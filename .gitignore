@@ -5,7 +5,8 @@
 *.pem
 
 # MLflow tracking / registry (generated)
-mlruns/
+mlruns/*
+!mlruns/.gitkeep
 mlartifacts/
 *.db
 *.db-*
