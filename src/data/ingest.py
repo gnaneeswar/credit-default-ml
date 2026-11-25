@@ -88,9 +88,25 @@ def build_dictionary(metadata: dict, variables: list[dict]) -> dict:
         "timeline": schema.TIMELINE,
         "documented_codes": _to_jsonable(schema.DOCUMENTED_CODES),
         "undocumented_codes": schema.UNDOCUMENTED_CODES,
+        "pay_status_definitions": {
+            "source": schema.PAY_STATUS_DEFINITIONS_SOURCE,
+            "definitions": schema.PAY_STATUS_DEFINITIONS,
+        },
         "uci_variable_info": (metadata.get("additional_info") or {}).get("variable_info"),
         "source_metadata": metadata,
     }
+
+
+def rebuild_dictionary(settings: Settings) -> dict:
+    """Rebuild the dictionary offline from the UCI metadata/variables stored in its JSON."""
+    old = json.loads(settings.dictionary_json.read_text(encoding="utf-8"))
+    log_path_io(log, "read", settings.dictionary_json)
+    variables = [
+        {k: v for k, v in var.items() if k != "canonical_name"} for var in old["variables"]
+    ]
+    dictionary = build_dictionary(old["source_metadata"], variables)
+    write_dictionary(settings, dictionary)
+    return dictionary
 
 
 def write_dictionary(settings: Settings, dictionary: dict) -> None:
@@ -161,6 +177,24 @@ def render_dictionary_md(d: dict) -> str:
     for col, u in d["undocumented_codes"].items():
         codes = ", ".join(f"`{c}`" for c in u["codes"])
         lines.append(f"| {col} | {codes} | {u['interpretation']} | {u['handling']} |")
+    psd = d["pay_status_definitions"]
+    lines += [
+        "",
+        f"## Low repayment-status codes — definitions ({psd['source']})",
+        "",
+        "| Code | Meaning | Financial behaviour |",
+        "|---|---|---|",
+    ]
+    lines += [
+        f"| `{x['code']}` | {x['meaning']} | {x['financial_behavior']} |"
+        for x in psd["definitions"]
+    ]
+    lines += [
+        "",
+        "Observed caveat: `-2` does not always coincide with a zero same-month bill (a balance,",
+        "fees or a credit can still appear), so status codes and bill amounts are kept as",
+        "separate signals — see `pay_code_bill_consistency` in `artifacts/eda_summary.json`.",
+    ]
     lines += ["", "## UCI variable information (verbatim)", "", "```", d["uci_variable_info"]]
     lines += ["```", ""]
     return "\n".join(lines)
@@ -200,8 +234,15 @@ def load_dataset(settings: Settings | None = None, refresh: bool = False) -> pd.
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--refresh", action="store_true", help="re-download from UCI")
+    parser.add_argument(
+        "--rebuild-dictionary",
+        action="store_true",
+        help="regenerate data_dictionary.json/.md offline from the stored UCI metadata",
+    )
     args = parser.parse_args(argv)
     with stage("ingest"):
+        if args.rebuild_dictionary:
+            rebuild_dictionary(get_settings())
         load_dataset(refresh=args.refresh)
 
 

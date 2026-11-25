@@ -38,6 +38,33 @@ def code_table(df: pd.DataFrame, col: str) -> pd.DataFrame:
     return g[[col, "count", "share", "default_rate", "documented"]]
 
 
+def pay_bill_consistency(df: pd.DataFrame) -> pd.DataFrame:
+    """For low PAY_n codes, how the same-month bill and payment actually look.
+
+    Validates the domain definitions (-2 no consumption, -1 paid in full, 0 revolving)
+    against the data rather than assuming them.
+    """
+    rows = []
+    for p, b, a in zip(
+        schema.PAY_STATUS_COLS, schema.BILL_AMT_COLS, schema.PAY_AMT_COLS, strict=True
+    ):
+        for code in (-2, -1, 0):
+            sub = df[df[p] == code]
+            rows.append(
+                {
+                    "pay_col": p,
+                    "code": code,
+                    "n": len(sub),
+                    "share_bill_eq_0": (sub[b] == 0).mean(),
+                    "share_bill_le_0": (sub[b] <= 0).mean(),
+                    "share_pay_amt_eq_0": (sub[a] == 0).mean(),
+                    "median_bill": float(sub[b].median()),
+                    "default_rate": sub[schema.TARGET].mean(),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def build_summary(df: pd.DataFrame, train: pd.DataFrame, test: pd.DataFrame) -> dict:
     target = df[schema.TARGET]
     codes = {c: code_table(df, c) for c in _DOCUMENTED}
@@ -79,7 +106,16 @@ def build_summary(df: pd.DataFrame, train: pd.DataFrame, test: pd.DataFrame) -> 
             c: json.loads(t.round(4).to_json(orient="records")) for c, t in codes.items()
         },
         "undocumented_codes": undocumented,
+        "pay_status_definitions": schema.PAY_STATUS_DEFINITIONS,
+        "pay_code_bill_consistency": json.loads(
+            pay_bill_consistency(df).round(4).to_json(orient="records")
+        ),
     }
+
+
+def _pay0_consistency(summary: dict) -> pd.DataFrame:
+    t = pd.DataFrame(summary["pay_code_bill_consistency"])
+    return t[t["pay_col"] == "PAY_0"]
 
 
 def render_report(summary: dict, codes: dict[str, pd.DataFrame]) -> str:
@@ -124,6 +160,15 @@ def render_report(summary: dict, codes: dict[str, pd.DataFrame]) -> str:
         "→ `0` (revolving, minimum paid) is the most common code and `-2` (inactive) is common;",
         "  both default *less* often than `-1` (paid duly), so collapsing them into `-1` would",
         "  destroy signal. All PAY_n codes are kept as distinct ordinal values.",
+        "",
+        "### Do the low codes match their definitions? (same-month bill / payment)",
+        "",
+        render_table(_pay0_consistency(summary)),
+        "",
+        "→ `0` (revolving) carries large balances and `-1` (paid in full) small ones, as defined.",
+        "  `-2` (no consumption) often still shows a non-zero bill (residual balance, fees or",
+        "  credits), so the pipeline never infers one signal from the other: `PAY_n == -2` counts",
+        "  and `BILL_AMT <= 0` flags are separate engineered features.",
         "",
         "## Numeric distributions",
         "",

@@ -58,7 +58,7 @@ Note: `PAY_AMTn` is the amount paid *in* month n; it is conventionally read as s
 - **SEX**: `1` = male; `2` = female
 - **EDUCATION**: `1` = graduate school; `2` = university; `3` = high school; `4` = others
 - **MARRIAGE**: `1` = married; `2` = single; `3` = others
-- **PAY_n**: `-1` = pay duly; `1` = payment delay for 1 month; `2` = payment delay for 2 months; `3` = payment delay for 3 months; `4` = payment delay for 4 months; `5` = payment delay for 5 months; `6` = payment delay for 6 months; `7` = payment delay for 7 months; `8` = payment delay for 8 months; `9` = payment delay for nine months and above
+- **PAY_n**: `-1` = pay duly (paid in full); `1` = payment delay for 1 month; `2` = payment delay for 2 months; `3` = payment delay for 3 months; `4` = payment delay for 4 months; `5` = payment delay for 5 months; `6` = payment delay for 6 months; `7` = payment delay for 7 months; `8` = payment delay for 8 months; `9` = payment delay for nine months and above
 
 ## Undocumented codes found in the data
 
@@ -66,7 +66,19 @@ Note: `PAY_AMTn` is the amount paid *in* month n; it is conventionally read as s
 |---|---|---|---|
 | EDUCATION | `0`, `5`, `6` | unknown / unlabelled education category | remap to 4 ('others'): rare and semantically 'not one of the named levels' |
 | MARRIAGE | `0` | unknown marital status | remap to 3 ('others') |
-| PAY_n | `-2`, `0` | -2 = no consumption / inactive (zero bill); 0 = revolving credit — minimum payment made, balance carried | preserve as distinct ordinal codes; they are behaviourally different from -1 (paid in full) and carry different default risk |
+| PAY_n | `-2`, `0` | -2 = no consumption (card not used that month); 0 = revolving credit (minimum paid on time, balance carried over) | preserve as distinct ordinal codes; they are behaviourally different from -1 (paid in full) and carry different default risk |
+
+## Low repayment-status codes — definitions (project domain clarification, supplementing UCI variable_info)
+
+| Code | Meaning | Financial behaviour |
+|---|---|---|
+| `-2` | No consumption | Card was not used that month; no bill was generated. |
+| `-1` | Paid in full | Statement balance was paid completely on time. |
+| `0` | Revolving credit | Minimum payment was made on time, but a balance was carried over. |
+
+Observed caveat: `-2` does not always coincide with a zero same-month bill (a balance,
+fees or a credit can still appear), so status codes and bill amounts are kept as
+separate signals — see `pay_code_bill_consistency` in `artifacts/eda_summary.json`.
 
 ## UCI variable information (verbatim)
 

@@ -16,6 +16,8 @@ Plan: leak-free credit-default pipeline (UCI 350) → MLflow registry `@champion
 
 ## Open issues / notes
 - EDA evidence (for README Design Decisions): EDUCATION 0/5/6 default 0-16% ~ code 4 (5.7%) -> remap justified by data; MARRIAGE 0 (n=54, 9.3%) vs 3 (26%) -> merged on semantics only, say so honestly; PAY 0 (12.8%) and -2 (13.2%) default LESS than -1 (16.8%) -> preserve codes. 35 duplicate feature rows w/ distinct IDs kept. 1930 rows have negative bills; 866 zero-bill all 6 months.
+- PAY_n definitions (user-supplied): -2 no consumption, -1 paid in full, 0 revolving. Data check: 0/-1 consistent, but -2 has non-zero same-month bill in ~75% of PAY_0 rows -> P2 must keep `N_INACTIVE` (PAY==-2 count) and bill<=0 flags as SEPARATE features; never derive one from the other.
+- `python -m src.data.ingest --rebuild-dictionary` regenerates the dictionary offline from stored UCI metadata.
 - UCI text fields contain CRLF and NaN: ingest normalises to LF + strict JSON (tested).
 - Locked: mlflow 3.18, evidently 0.7.23 (new Report/Dataset API), sklearn 1.9.1, pandas 3.1, lightgbm 4.7, xgboost 3.4. uv 0.13 lives in `~/.local/bin`.
 - Branch is `main`; pushes authenticate via Windows Git Credential Manager (`ucrt64/bin/git-credential-manager.exe`).

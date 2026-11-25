@@ -36,7 +36,7 @@ DOCUMENTED_CODES: dict[str, dict[int, str]] = {
     "EDUCATION": {1: "graduate school", 2: "university", 3: "high school", 4: "others"},
     "MARRIAGE": {1: "married", 2: "single", 3: "others"},
     "PAY_n": {
-        -1: "pay duly",
+        -1: "pay duly (paid in full)",
         **{k: f"payment delay for {k} month{'s' if k > 1 else ''}" for k in range(1, 9)},
         9: "payment delay for nine months and above",
     },
@@ -57,8 +57,8 @@ UNDOCUMENTED_CODES: dict[str, dict] = {
     "PAY_n": {
         "codes": [-2, 0],
         "interpretation": (
-            "-2 = no consumption / inactive (zero bill); "
-            "0 = revolving credit — minimum payment made, balance carried"
+            "-2 = no consumption (card not used that month); "
+            "0 = revolving credit (minimum paid on time, balance carried over)"
         ),
         "handling": (
             "preserve as distinct ordinal codes; they are behaviourally different from -1 "
@@ -66,6 +66,27 @@ UNDOCUMENTED_CODES: dict[str, dict] = {
         ),
     },
 }
+
+# Domain clarification of the low PAY_n codes (not part of the UCI documentation; provided
+# as a domain definition for this project). The EDA checks each against same-month bills.
+PAY_STATUS_DEFINITIONS: list[dict] = [
+    {
+        "code": -2,
+        "meaning": "No consumption",
+        "financial_behavior": "Card was not used that month; no bill was generated.",
+    },
+    {
+        "code": -1,
+        "meaning": "Paid in full",
+        "financial_behavior": "Statement balance was paid completely on time.",
+    },
+    {
+        "code": 0,
+        "meaning": "Revolving credit",
+        "financial_behavior": "Minimum payment was made on time, but a balance was carried over.",
+    },
+]
+PAY_STATUS_DEFINITIONS_SOURCE = "project domain clarification, supplementing UCI variable_info"
 
 BUSINESS_PROBLEM = (
     "Predict whether a credit-card holder will default on next month's payment (Oct 2005) "

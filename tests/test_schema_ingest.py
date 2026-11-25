@@ -68,6 +68,22 @@ def test_data_dictionary_is_complete_and_regenerable() -> None:
     assert ingest.render_dictionary_md(d) == REPO.dictionary_md.read_text(encoding="utf-8")
 
 
+def test_pay_status_definitions_in_dictionary() -> None:
+    d = json.loads(REPO.dictionary_json.read_text(encoding="utf-8"))
+    defs = {x["code"]: x["meaning"] for x in d["pay_status_definitions"]["definitions"]}
+    assert defs == {-2: "No consumption", -1: "Paid in full", 0: "Revolving credit"}
+    assert "Revolving credit" in REPO.dictionary_md.read_text(encoding="utf-8")
+
+
+def test_dictionary_rebuilds_offline_idempotently(tmp_path: Path) -> None:
+    s = Settings(root=tmp_path)
+    s.dictionary_json.parent.mkdir(parents=True)
+    s.dictionary_json.write_bytes(REPO.dictionary_json.read_bytes())
+    ingest.rebuild_dictionary(s)
+    assert s.dictionary_json.read_bytes() == REPO.dictionary_json.read_bytes()
+    assert s.dictionary_md.read_bytes() == REPO.dictionary_md.read_bytes()
+
+
 def test_stratified_split_is_deterministic(df: pd.DataFrame) -> None:
     train, test = train_test(df, REPO)
     assert (len(train), len(test)) == (24000, 6000)
@@ -95,3 +111,7 @@ def test_eda_artifacts(df: pd.DataFrame, tmp_path: Path) -> None:
     u = summary["undocumented_codes"]
     assert set(u["EDUCATION"]) == {"0", "5", "6"} and set(u["MARRIAGE"]) == {"0"}
     assert all(set(u[c]) == {"-2", "0"} for c in schema.PAY_STATUS_COLS)
+    cons = pd.DataFrame(summary["pay_code_bill_consistency"])
+    assert len(cons) == 6 * 3
+    revolving = cons[(cons["pay_col"] == "PAY_0") & (cons["code"] == 0)].iloc[0]
+    assert revolving["share_bill_le_0"] < 0.01  # revolving => a balance exists
