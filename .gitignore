@@ -1,0 +1,30 @@
+# Environments & secrets
+.venv/
+.env
+.env.*
+*.pem
+
+# MLflow tracking / registry (generated)
+mlruns/
+mlartifacts/
+*.db
+*.db-*
+*.db.*
+
+# Generated pipeline outputs (keep folder)
+artifacts/*
+!artifacts/.gitkeep
+
+# Caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.claude/settings.local.json

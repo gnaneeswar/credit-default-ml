@@ -1,0 +1,52 @@
+[project]
+name = "credit-default-ml"
+version = "0.1.0"
+description = "End-to-end credit default prediction: leak-free sklearn pipelines, MLflow registry, FastAPI serving, Evidently monitoring."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "pyarrow>=16",
+    "scikit-learn>=1.5",
+    "lightgbm>=4.3",
+    "xgboost>=2.1",
+    "mlflow>=2.16",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "pydantic>=2.7",
+    "requests>=2.32",
+    "tabulate>=0.9",
+    "matplotlib>=3.9",
+    "evidently>=0.7",
+    "ucimlrepo>=0.0.7",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "httpx>=0.27",
+    "ruff>=0.6",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = ["ignore::DeprecationWarning", "ignore::FutureWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [".venv", "mlruns", "artifacts"]
+
+[tool.ruff.lint]
+# PTH enforces pathlib-only file handling across the codebase.
+select = ["E", "F", "W", "I", "B", "UP", "PTH", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B018"]

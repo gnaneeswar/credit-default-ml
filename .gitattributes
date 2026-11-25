@@ -1,0 +1,9 @@
+# Enforce LF everywhere; mark binaries explicitly.
+* text=auto eol=lf
+*.sh text eol=lf
+Dockerfile* text eol=lf
+*.png binary
+*.jpg binary
+*.db binary
+*.parquet binary
+*.pkl binary
