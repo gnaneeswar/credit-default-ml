@@ -7,14 +7,17 @@ Plan: leak-free credit-default pipeline (UCI 350) → MLflow registry `@champion
 - [x] P1 Data — ucimlrepo ingest + cache, data dictionary (json/md), canonical names, stratified split, EDA artifacts
 - [x] P2 Features — DomainCleaner, DomainFeatureEngineer, WoEIVSelector + leakage tests
 - [x] P3 Training — 4-model GridSearchCV (3-fold), OOF decile threshold, registry `@champion`, holdout eval (<45s)
-- [ ] P4 Serving — FastAPI `/health` + `/invocations` (dataframe_split), batch client (drops target col)
+- [x] P4 Serving — FastAPI `/health` + `/invocations` (dataframe_split), batch client (drops target col)
 - [ ] P5 Monitoring — Evidently drift + classification scenarios, report html + summary json
 - [ ] P6 Docker + README + push — Dockerfile.train/serve, compose, sample_request.json, Design Decisions
 
 ## Next steps
-- P4: `src/inference/schemas.py` (pydantic dataframe_split), `app.py` (lifespan load via `src.common.mlflow_utils.load_champion`; reorder+cast to signature `input_columns`, float64; 422 on missing/unknown cols; /health 503 w/o model), `batch_client.py` (drop target col; one POST; artifacts/batch_predictions.csv with actuals), `sample_request.json`, tests (TestClient + fake model, AST import-boundary test).
+- P5: `src/monitoring/drift.py` (Evidently 0.7.23 new API: Report/Dataset/DataDefinition/BinaryClassification; DataDriftPreset + ClassificationPreset), scenarios: reference = artifacts/holdout/train_reference.parquet (OOF preds) vs (a) test scored by @champion, (b) simulated covariate drift (LIMIT_BAL x0.6, PAY_0+1, BILL_AMT x1.4) re-scored, (c) degraded labels -> F1/accuracy drop. Outputs monitoring_report.html (+ per-scenario html), monitoring_summary.json, logged to MLflow; wire `monitor` stage into src/training/run.py DEFAULT_STAGES; tests on synthetic frames.
 
 ## Open issues / notes
+- P4 live check: /health ok; sample_request.json (delinquent default p=0.91 flagged, revolving + inactive approved); batch client 6000 rows in one POST 0.13s, F1 0.5379 == holdout eval (serving path == evaluated path). Server scores 6000 rows in ~64 ms.
+- API contract: exact 23 signature columns any order (reordered + cast float64); strict finite numbers (no str/bool/null/NaN); 422 lists missing/unknown cols; custom 422 handler never echoes input (default echoed full payload; NaN in it -> 500). /health 503 + error text if model load fails (process stays up).
+- `Settings.tracking_uri` honours MLFLOW_TRACKING_URI (default relative). Tests set a per-test absolute URI because MLflow caches stores by URI string.
 - P3 results (full run, 33s wall / 30s pipeline): CV F1 RF 0.5460±0.0065 > LGBM 0.5438 > XGB 0.5420 > LR-WoE 0.5346 (ROC-AUC 0.778-0.785). Champion RF; cutoff 0.4752 (top 27% via coarse decile k=3 -> percentile refine). Holdout F1 0.538 @cutoff vs 0.541 @0.5 (prior run reversed: 0.542 vs 0.539). OOF F1 identical (0.5459) -> flat F1 plateau ~0.47-0.52; diffs << CV std / holdout SE (~0.015). README: say honestly; do NOT retune on test; production cutoff should come from cost matrix.
 - Serialization: MLflow 3.18 sklearn flavor = skops (not pickle). Trusted types derived per model + allowlist (src.features., sklearn., xgboost., lightgbm., numpy.), stored in MLmodel. WoEIVSelector stores IV table as records (skops can't persist DataFrames).
 - Models signed/trained on float64 inputs (MLflow integer-schema caveat; clients may send 20000.0/null).

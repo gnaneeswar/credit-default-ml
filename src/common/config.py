@@ -28,7 +28,10 @@ class Settings:
     iv_min: float = 0.02
 
     # --- MLflow (relative URIs on purpose: identical across local + containers) ---
-    tracking_uri: str = "sqlite:///mlruns/mlflow.db"
+    # Honours MLflow's standard MLFLOW_TRACKING_URI env var; default is the relative store.
+    tracking_uri: str = field(
+        default_factory=lambda: os.environ.get("MLFLOW_TRACKING_URI", "sqlite:///mlruns/mlflow.db")
+    )
     artifact_root: str = "./mlruns"
     experiment_name: str = "credit-default"
     model_name: str = "credit-default-pipeline"

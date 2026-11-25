@@ -1,48 +1,23 @@
 """Phase 3: tuning, decile threshold selection, skops allowlist, registry round-trip."""
 
 import json
+import os
 import subprocess
 import sys
-from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import pytest
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.dummy import DummyClassifier
-from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 
 from src.common.config import Settings
-from src.common.mlflow_utils import configure_tracking
-from src.data.ingest import load_dataset
-from src.data.split import make_cv, split_xy, train_test
-from src.features.domain import DomainCleaner, DomainFeatureEngineer
-from src.features.woe import WoEIVSelector
+from src.data.split import make_cv
 from src.training.models import MODEL_SPECS, ModelSpec
-from src.training.registry import log_and_register, trusted_types
+from src.training.registry import trusted_types
 from src.training.threshold import choose_threshold, decile_table
 from src.training.tune import tune_model
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-
-
-@pytest.fixture(scope="module")
-def small_xy() -> tuple[pd.DataFrame, pd.Series]:
-    train, _ = train_test(load_dataset(Settings(root=REPO_ROOT)))
-    X, y = split_xy(train.sample(3000, random_state=7).reset_index(drop=True))
-    return X.astype("float64"), y
-
-
-def _lr_pipeline() -> Pipeline:
-    return Pipeline(
-        [
-            ("clean", DomainCleaner()),
-            ("features", DomainFeatureEngineer()),
-            ("woe", WoEIVSelector()),
-            ("model", LogisticRegression(max_iter=1000, class_weight="balanced")),
-        ]
-    )
+from tests.conftest import REPO_ROOT, TINY_THRESHOLD, lr_pipeline
 
 
 # ------------------------------------------------------------------ model specs
@@ -114,7 +89,7 @@ class _Rogue(TransformerMixin, BaseEstimator):
 
 def test_trusted_types_allowlist(small_xy) -> None:
     X, y = small_xy
-    good = _lr_pipeline().fit(X, y)
+    good = lr_pipeline().fit(X, y)
     types = trusted_types(good)
     assert "src.features.woe.WoEIVSelector" in types
     rogue = Pipeline([("rogue", _Rogue()), ("model", DummyClassifier())]).fit(X, y)
@@ -127,6 +102,7 @@ _SERVE_SIDE = """
 import json, sys
 import pandas as pd
 from src.common.config import Settings
+from tests.conftest import REPO_ROOT, TINY_THRESHOLD, lr_pipeline
 from src.common.mlflow_utils import load_champion
 model, info = load_champion(Settings())
 rows = pd.read_json(sys.argv[1], orient="split")
@@ -141,43 +117,11 @@ print("RESULT=" + json.dumps({
 """
 
 
-def test_registry_roundtrip_in_fresh_serving_process(small_xy, tmp_path, monkeypatch) -> None:
+def test_registry_roundtrip_in_fresh_serving_process(small_xy, tiny_champion) -> None:
     """Register a real-transformer pipeline, then load @champion in a process that never
     imports src.training — exactly what the serving container does."""
-    from src.training.threshold import ThresholdChoice
-    from src.training.tune import TuneResult
-
-    X, y = small_xy
-    monkeypatch.chdir(tmp_path)  # relative sqlite:///mlruns/... resolves under tmp
-    settings = Settings(root=tmp_path)
-    pipe = _lr_pipeline().fit(X, y)
-    best = TuneResult(
-        spec=MODEL_SPECS["logistic_regression"],
-        best_estimator=pipe,
-        best_params={"model__C": 1.0},
-        cv_metrics={"mean_f1": 0.5, "mean_roc_auc": 0.75, "std_f1": 0.01},
-        candidates=pd.DataFrame(),
-        seconds=0.0,
-    )
-    choice = ThresholdChoice(
-        threshold=0.42,
-        deciles_flagged=3,
-        decile_f1=0.5,
-        top_percent_flagged=27,
-        f1=0.51,
-        precision=0.45,
-        recall=0.6,
-        flagged_share=0.27,
-        fine_threshold=0.41,
-        fine_f1=0.52,
-        f1_at_050=0.5,
-    )
-
-    import mlflow
-
-    exp_id = configure_tracking(settings)
-    with mlflow.start_run(experiment_id=exp_id):
-        version = log_and_register(best, X, choice, settings)
+    X, _ = small_xy
+    pipe, version, tmp_path = tiny_champion
 
     # Serving sends columns in arbitrary order; the loader's signature restores it.
     rows = X.head(4)[list(reversed(X.columns))]
@@ -186,7 +130,11 @@ def test_registry_roundtrip_in_fresh_serving_process(small_xy, tmp_path, monkeyp
     proc = subprocess.run(
         [sys.executable, "-c", _SERVE_SIDE, str(payload)],
         cwd=tmp_path,
-        env={"PYTHONPATH": str(REPO_ROOT), "PATH": "/usr/bin:/bin"},
+        env={
+            "PYTHONPATH": str(REPO_ROOT),
+            "PATH": "/usr/bin:/bin",
+            "MLFLOW_TRACKING_URI": os.environ["MLFLOW_TRACKING_URI"],
+        },
         capture_output=True,
         text=True,
         timeout=120,
@@ -195,6 +143,6 @@ def test_registry_roundtrip_in_fresh_serving_process(small_xy, tmp_path, monkeyp
     result = json.loads(proc.stdout.split("RESULT=")[-1])
     assert result["training_imported"] is False
     assert result["version"] == version == "1"
-    assert result["threshold"] == pytest.approx(0.42)
+    assert result["threshold"] == pytest.approx(TINY_THRESHOLD)
     assert result["columns"] == list(X.columns)
     np.testing.assert_allclose(result["proba"], pipe.predict_proba(X.head(4))[:, 1])

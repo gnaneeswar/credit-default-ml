@@ -36,7 +36,11 @@ package = false
 pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "-ra"
-filterwarnings = ["ignore::DeprecationWarning", "ignore::FutureWarning"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::FutureWarning",
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+]
 
 [tool.ruff]
 line-length = 100
