@@ -9,7 +9,11 @@ from tabulate import tabulate
 
 
 def render_table(df: pd.DataFrame, floatfmt: str = ".4f", index: bool = False) -> str:
-    return tabulate(df, headers="keys", tablefmt="github", floatfmt=floatfmt, showindex=index)
+    frame = df.reset_index() if index else df
+    # Row dicts keep per-cell Python types, so ints are not upcast to floats in the output.
+    return tabulate(
+        frame.to_dict(orient="records"), headers="keys", tablefmt="github", floatfmt=floatfmt
+    )
 
 
 def log_table(

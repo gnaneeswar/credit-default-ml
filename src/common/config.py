@@ -10,10 +10,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Pin native thread pools before any numeric library is imported. Parallelism lives
-# at the GridSearchCV level (n_jobs=-1); nested OpenMP threads would oversubscribe CPUs.
-for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
-    os.environ.setdefault(_var, "1")
+# Thread-pool pinning (OMP_NUM_THREADS=1 etc.) lives in src/__init__.py so it runs first.
 
 
 def _root() -> Path:

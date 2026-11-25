@@ -126,15 +126,25 @@ class WoEIVSelector(TransformerMixin, BaseEstimator):
         table = pd.DataFrame(rows).sort_values("iv", ascending=False, ignore_index=True)
         table["strength"] = table["iv"].map(iv_strength)
         table["selected"] = table["iv"] >= self.iv_min
-        self.iv_table_ = table
+        # Stored as plain records (not a DataFrame) so the fitted pipeline serialises with
+        # skops, which cannot persist pandas internals. ``iv_table_`` rebuilds the frame.
+        self.iv_records_ = [
+            {k: (v.item() if hasattr(v, "item") else v) for k, v in rec.items()}
+            for rec in table.to_dict(orient="records")
+        ]
         self.selected_features_ = table.loc[table["selected"], "feature"].tolist()
         if not self.selected_features_:
             # Never hand an empty matrix to the estimator: keep the single best feature.
             self.selected_features_ = [table.loc[0, "feature"]]
         return self
 
+    @property
+    def iv_table_(self) -> pd.DataFrame:
+        """IV ranking: feature, iv, n_bins, strength, selected (sorted by IV desc)."""
+        return pd.DataFrame(self.iv_records_)
+
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        check_is_fitted(self, "iv_table_")
+        check_is_fitted(self, "iv_records_")
         missing = [c for c in self.selected_features_ if c not in X.columns]
         if missing:
             raise ValueError(f"WoEIVSelector: missing columns {missing}")
@@ -148,12 +158,12 @@ class WoEIVSelector(TransformerMixin, BaseEstimator):
         return pd.DataFrame(out, index=X.index)
 
     def get_feature_names_out(self, input_features=None) -> np.ndarray:
-        check_is_fitted(self, "iv_table_")
+        check_is_fitted(self, "iv_records_")
         return np.asarray([f"WOE_{c}" for c in self.selected_features_], dtype=object)
 
     def bin_table(self, col: str) -> pd.DataFrame:
         """Human-readable bins for one feature (for reports / interview walkthroughs)."""
-        check_is_fitted(self, "iv_table_")
+        check_is_fitted(self, "iv_records_")
         cuts = self.cuts_[col]
         lows = np.concatenate([[-np.inf], cuts])
         highs = np.concatenate([cuts, [np.inf]])
