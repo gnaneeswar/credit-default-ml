@@ -1,6 +1,6 @@
 """Out-of-fold scoring and decile-based F1 threshold selection.
 
-``cross_val_predict`` with the same 3-fold splitter gives every training row exactly one
+Out-of-fold scoring with the same 3-fold splitter gives every training row exactly one
 prediction from a model that never saw it — an honest, full-coverage basis for choosing a
 cutoff without touching the test set or carving out a static validation split.
 
@@ -19,13 +19,15 @@ The unconstrained fine-grained F1 optimum and the default 0.5 are reported for c
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+from joblib import Parallel, delayed
 from sklearn.base import clone
 from sklearn.metrics import f1_score, precision_recall_curve
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 
 from src.common.logging import get_logger
@@ -52,11 +54,47 @@ class ThresholdChoice:
         return dict(self.__dict__)
 
 
-def oof_probabilities(
-    estimator: Pipeline, X: pd.DataFrame, y: pd.Series, cv: StratifiedKFold
-) -> np.ndarray:
-    proba = cross_val_predict(clone(estimator), X, y, cv=cv, method="predict_proba", n_jobs=-1)
-    return proba[:, 1]
+def _fit(estimator: Pipeline, X: pd.DataFrame, y: pd.Series) -> Pipeline:
+    return estimator.fit(X, y)
+
+
+def refit_with_oof(
+    template: Pipeline,
+    X: pd.DataFrame,
+    y: pd.Series,
+    cv: StratifiedKFold,
+    extra: dict[str, Pipeline] | None = None,
+) -> tuple[Pipeline, np.ndarray, dict[str, Pipeline]]:
+    """One parallel batch: full-train refit of the winner, its k out-of-fold fits, and any
+    ``extra`` full-train refits (e.g. LR for the IV table).
+
+    Equivalent to ``refit`` + ``cross_val_predict(method="predict_proba")`` with the same
+    splitter, but the k+1+len(extra) independent fits run concurrently instead of serially.
+    Returns (refitted winner, OOF P(default) for every training row, refitted extras).
+    """
+    folds = list(cv.split(X, y))
+    extra = extra or {}
+    # The full-data refit is the longest job in this batch; give it the cores the other
+    # fits leave idle, then restore n_jobs=1 so the logged/served model is single-threaded.
+    spare = max(1, (os.cpu_count() or 1) - len(folds) - len(extra))
+    full = clone(template)
+    threaded = full.get_params().get("model__n_jobs") == 1  # tree models we pinned explicitly
+    if threaded:
+        full.set_params(model__n_jobs=spare)
+    jobs = [delayed(_fit)(full, X, y)]
+    jobs += [delayed(_fit)(clone(template), X.iloc[tr], y.iloc[tr]) for tr, _ in folds]
+    jobs += [delayed(_fit)(clone(est), X, y) for est in extra.values()]
+    fitted = Parallel(n_jobs=-1)(jobs)
+
+    winner, fold_models, extra_fitted = (
+        fitted[0],
+        fitted[1 : 1 + len(folds)],
+        fitted[1 + len(folds) :],
+    )
+    oof = np.empty(len(X), dtype=float)
+    for model, (_, te) in zip(fold_models, folds, strict=True):
+        oof[te] = model.predict_proba(X.iloc[te])[:, 1]
+    return winner, oof, dict(zip(extra, extra_fitted, strict=True))
 
 
 def decile_table(y: pd.Series | np.ndarray, proba: np.ndarray) -> pd.DataFrame:

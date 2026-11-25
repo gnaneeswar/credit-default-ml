@@ -17,3 +17,4 @@ for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
 os.environ.setdefault("MLFLOW_ENABLE_ARTIFACTS_PROGRESS_BAR", "false")
 os.environ.setdefault("MLFLOW_DISABLE_TELEMETRY", "true")
 os.environ.setdefault("DO_NOT_TRACK", "true")
+os.environ.setdefault("MLFLOW_DISABLE_AGENT_HINT", "1")

@@ -61,11 +61,12 @@ def tiny_champion(small_xy, tmp_path, monkeypatch):
     pipe = lr_pipeline().fit(X, y)
     best = TuneResult(
         spec=MODEL_SPECS["logistic_regression"],
-        best_estimator=pipe,
+        template=lr_pipeline(),
         best_params={"model__C": 1.0},
         cv_metrics={"mean_f1": 0.5, "mean_roc_auc": 0.75, "std_f1": 0.01},
         candidates=pd.DataFrame(),
         seconds=0.0,
+        best_estimator=pipe,
     )
     choice = ThresholdChoice(
         threshold=TINY_THRESHOLD,

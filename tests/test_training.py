@@ -50,6 +50,21 @@ def test_tune_model_reports_all_cv_metrics(small_xy) -> None:
     assert 0.3 < res.cv_metrics["mean_f1"] < 0.8
 
 
+def test_refit_with_oof_matches_cross_val_predict(small_xy) -> None:
+    from sklearn.model_selection import cross_val_predict
+
+    from src.training.threshold import refit_with_oof
+
+    X, y = small_xy
+    cv = make_cv(Settings())
+    winner, oof, extra = refit_with_oof(lr_pipeline(), X, y, cv, {"lr": lr_pipeline()})
+    expected = cross_val_predict(lr_pipeline(), X, y, cv=cv, method="predict_proba")[:, 1]
+    np.testing.assert_allclose(oof, expected, rtol=1e-10)
+    full = lr_pipeline().fit(X, y)
+    np.testing.assert_allclose(winner.predict_proba(X), full.predict_proba(X), rtol=1e-10)
+    np.testing.assert_allclose(extra["lr"].predict_proba(X), full.predict_proba(X), rtol=1e-10)
+
+
 # ---------------------------------------------------------------- deciles/cutoff
 def test_decile_table_structure() -> None:
     rng = np.random.default_rng(0)

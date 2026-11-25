@@ -8,13 +8,16 @@ Plan: leak-free credit-default pipeline (UCI 350) → MLflow registry `@champion
 - [x] P2 Features — DomainCleaner, DomainFeatureEngineer, WoEIVSelector + leakage tests
 - [x] P3 Training — 4-model GridSearchCV (3-fold), OOF decile threshold, registry `@champion`, holdout eval (<45s)
 - [x] P4 Serving — FastAPI `/health` + `/invocations` (dataframe_split), batch client (drops target col)
-- [ ] P5 Monitoring — Evidently drift + classification scenarios, report html + summary json
+- [x] P5 Monitoring — Evidently drift + classification scenarios, report html + summary json
 - [ ] P6 Docker + README + push — Dockerfile.train/serve, compose, sample_request.json, Design Decisions
 
 ## Next steps
-- P5: `src/monitoring/drift.py` (Evidently 0.7.23 new API: Report/Dataset/DataDefinition/BinaryClassification; DataDriftPreset + ClassificationPreset), scenarios: reference = artifacts/holdout/train_reference.parquet (OOF preds) vs (a) test scored by @champion, (b) simulated covariate drift (LIMIT_BAL x0.6, PAY_0+1, BILL_AMT x1.4) re-scored, (c) degraded labels -> F1/accuracy drop. Outputs monitoring_report.html (+ per-scenario html), monitoring_summary.json, logged to MLflow; wire `monitor` stage into src/training/run.py DEFAULT_STAGES; tests on synthetic frames.
+- P6: give user the sudo block for Docker Engine (docker-ce, cli, containerd.io, buildx, compose plugin; usermod -aG docker). Dockerfile.train / Dockerfile.serve (python:3.12-slim-bookworm linux/amd64, pinned uv, apt libgomp1, `uv sync --frozen --no-dev --no-install-project`, ENV PATH=/app/.venv/bin HOME=/tmp MPLCONFIGDIR USER/LOGNAME, WORKDIR /app, CMD python/uvicorn directly). Serve copies only src/common, src/features, src/inference. docker-compose.yml (train -> serve, service_completed_successfully, ./mlruns + ./artifacts bind mounts, user UID:GID). .dockerignore. README (business, architecture, Design Decisions 1-5 incl. SEX fairness + flat-F1 cutoff honesty, run/verify/cleanup). Verify clean compose + sequential runs; time train container; push.
 
 ## Open issues / notes
+- P5 results: holdout drift 0.00, F1 0.538 (Δ-0.008) no alerts; covariate_drift share 0.57 (13 cols: LIMIT_BAL, PAY_*, BILL_AMT*; PAY_AMT* untouched) F1 0.399 → drift+perf alerts; concept_drift (30% labels flipped) drift 0.00, F1 0.404 → perf alert only (argument for label monitoring). Alert policy: drift share >= 0.25, F1/accuracy drop > 0.05 vs OOF reference.
+- pandas pinned <3: evidently 0.7.23 imports pandas internals removed in pandas 3 (its own dev stubs pin pandas<3).
+- Runtime work (full 5-stage run now 38-41s pipeline / 43-45s wall at loadavg 3-5): MLflow init in background thread overlapping searches; GridSearchCV refit=False + one parallel batch (winner refit w/ spare cores then n_jobs reset to 1, 3 OOF folds, LR refit for IV); monitoring = 3 Evidently reports in a spawn ProcessPool pre-warmed (import evidently ~4.7s) right after searches. Threads don't help Evidently (GIL-bound, measured). Results bit-identical.
 - P4 live check: /health ok; sample_request.json (delinquent default p=0.91 flagged, revolving + inactive approved); batch client 6000 rows in one POST 0.13s, F1 0.5379 == holdout eval (serving path == evaluated path). Server scores 6000 rows in ~64 ms.
 - API contract: exact 23 signature columns any order (reordered + cast float64); strict finite numbers (no str/bool/null/NaN); 422 lists missing/unknown cols; custom 422 handler never echoes input (default echoed full payload; NaN in it -> 500). /health 503 + error text if model load fails (process stays up).
 - `Settings.tracking_uri` honours MLFLOW_TRACKING_URI (default relative). Tests set a per-test absolute URI because MLflow caches stores by URI string.

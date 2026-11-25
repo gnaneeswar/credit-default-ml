@@ -42,9 +42,6 @@ def configure_tracking(settings: Settings | None = None, create: bool = True) ->
     Fails fast if an existing experiment's artifact root differs from ``./mlruns`` under
     the current working dir — e.g. a db trained on the host mounted into ``/app``.
     """
-    import os
-
-    os.environ.setdefault("MLFLOW_DISABLE_AGENT_HINT", "1")
     import mlflow
 
     quiet_mlflow()

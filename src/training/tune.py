@@ -1,11 +1,19 @@
-"""Grid search with 3-fold stratified CV and per-model MLflow child runs."""
+"""Grid search with 3-fold stratified CV, plus per-model MLflow child runs.
+
+Searches run with ``refit=False``: refitting every model's best candidate on the full
+training set would be four sequential single-core fits, three of them discarded. Only the
+winner (and LR, for the IV table) is refitted afterwards — in parallel with the winner's
+out-of-fold predictions (see ``threshold.refit_with_oof``).
+"""
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
+from sklearn.base import clone
 from sklearn.model_selection import GridSearchCV, StratifiedKFold
 from sklearn.pipeline import Pipeline
 
@@ -28,13 +36,13 @@ SCORING = {
 @dataclass
 class TuneResult:
     spec: ModelSpec
-    best_estimator: Pipeline
+    template: Pipeline  # unfitted pipeline carrying the best (CV-F1) hyper-parameters
     best_params: dict
-    cv_metrics: dict[str, float]  # mean_* and std_* for the refit (best-F1) candidate
+    cv_metrics: dict[str, float]  # mean_* and std_* for the best-F1 candidate
     candidates: pd.DataFrame
     seconds: float
+    best_estimator: Pipeline | None = None  # set only for refitted models
     run_id: str | None = None
-    extra: dict = field(default_factory=dict)
 
     def summary_row(self) -> dict:
         row = {"model": self.spec.name, "family": self.spec.family}
@@ -63,10 +71,7 @@ def tune_model(
     cv: StratifiedKFold,
     settings: Settings,
     pos_weight: float,
-    experiment_id: str | None = None,
 ) -> TuneResult:
-    import mlflow
-
     log.info(
         "%s: GridSearchCV %d candidates x %d folds = %d fits (n_jobs=-1, scoring=f1)",
         spec.name,
@@ -74,11 +79,12 @@ def tune_model(
         cv.get_n_splits(),
         spec.n_candidates * cv.get_n_splits(),
     )
+    base = spec.build(settings, pos_weight)
     search = GridSearchCV(
-        spec.build(settings, pos_weight),
+        base,
         param_grid=spec.grid,
         scoring=SCORING,
-        refit="f1",
+        refit=False,
         cv=cv,
         n_jobs=-1,
         error_score="raise",
@@ -87,30 +93,36 @@ def tune_model(
     search.fit(X, y)
     seconds = time.perf_counter() - start
 
-    i = search.best_index_
+    res = search.cv_results_
+    i = int(np.argmin(res["rank_test_f1"]))  # best mean CV F1 (ties -> first)
+    best_params = res["params"][i]
     cv_metrics = {}
     for m in SCORING:
-        cv_metrics[f"mean_{m}"] = float(search.cv_results_[f"mean_test_{m}"][i])
-        cv_metrics[f"std_{m}"] = float(search.cv_results_[f"std_test_{m}"][i])
+        cv_metrics[f"mean_{m}"] = float(res[f"mean_test_{m}"][i])
+        cv_metrics[f"std_{m}"] = float(res[f"std_test_{m}"][i])
     candidates = _candidate_table(search)
     log_table(log, f"{spec.name}: candidates ranked by CV F1 ({seconds:.1f}s)", candidates)
-
-    result = TuneResult(
+    return TuneResult(
         spec=spec,
-        best_estimator=search.best_estimator_,
-        best_params=search.best_params_,
+        template=clone(base).set_params(**best_params),
+        best_params=best_params,
         cv_metrics=cv_metrics,
         candidates=candidates,
         seconds=seconds,
     )
-    if experiment_id is not None:
-        with mlflow.start_run(run_name=spec.name, nested=True, experiment_id=experiment_id) as run:
-            mlflow.set_tags({"model_name": spec.name, "model_family": spec.family})
-            mlflow.log_params({k.replace("model__", ""): v for k, v in search.best_params_.items()})
-            mlflow.log_params({"n_candidates": spec.n_candidates, "cv_folds": cv.get_n_splits()})
-            mlflow.log_metrics({f"cv_{k}": v for k, v in cv_metrics.items()})
-            mlflow.log_metric("search_seconds", seconds)
-            mlflow.log_table(candidates, artifact_file=f"cv_candidates_{spec.name}.json")
-            result.run_id = run.info.run_id
-        log.info("%s: MLflow child run %s", spec.name, result.run_id)
-    return result
+
+
+def log_child_run(result: TuneResult, experiment_id: str, cv_folds: int) -> None:
+    """Log one model's search as a nested run (call inside the active parent run)."""
+    import mlflow
+
+    spec = result.spec
+    with mlflow.start_run(run_name=spec.name, nested=True, experiment_id=experiment_id) as run:
+        mlflow.set_tags({"model_name": spec.name, "model_family": spec.family})
+        mlflow.log_params({k.replace("model__", ""): v for k, v in result.best_params.items()})
+        mlflow.log_params({"n_candidates": spec.n_candidates, "cv_folds": cv_folds})
+        mlflow.log_metrics({f"cv_{k}": v for k, v in result.cv_metrics.items()})
+        mlflow.log_metric("search_seconds", result.seconds)
+        mlflow.log_table(result.candidates, artifact_file=f"cv_candidates_{spec.name}.json")
+        result.run_id = run.info.run_id
+    log.info("%s: MLflow child run %s", spec.name, result.run_id)

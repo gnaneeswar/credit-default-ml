@@ -36,6 +36,8 @@ class Context:
     train: pd.DataFrame | None = None
     test: pd.DataFrame | None = None
     models: list[str] | None = None  # None = all candidate models
+    stages: list[str] = field(default_factory=list)
+    monitor_pool: object | None = None  # pre-warmed Evidently workers (see stage_train)
     versions: dict = field(default_factory=dict)
     timings: list[dict] = field(default_factory=list)
 
@@ -61,12 +63,12 @@ def stage_eda(ctx: Context) -> None:
 
 
 def stage_train(ctx: Context) -> None:
-    import mlflow
+    from concurrent.futures import ThreadPoolExecutor
 
     from src.training.models import MODEL_SPECS
     from src.training.registry import log_and_register
-    from src.training.threshold import choose_threshold, decile_table, oof_probabilities
-    from src.training.tune import tune_model
+    from src.training.threshold import choose_threshold, decile_table, refit_with_oof
+    from src.training.tune import log_child_run, tune_model
 
     s = ctx.settings
     ctx.ensure_split()
@@ -78,7 +80,62 @@ def stage_train(ctx: Context) -> None:
         "class balance: positives=%d (%.2f%%), neg/pos=%.3f", y.sum(), 100 * y.mean(), pos_weight
     )
 
-    exp_id = configure_tracking(s)
+    # `import mlflow` + SQLite schema creation take ~5s of single-core work; overlap them with
+    # the CPU-bound searches (which run in worker processes) instead of waiting up front.
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlflow-init") as pool:
+        tracking = pool.submit(configure_tracking, s)
+
+        specs = [MODEL_SPECS[m] for m in (ctx.models or MODEL_SPECS)]
+        if "logistic_regression" not in {sp.name for sp in specs}:
+            specs.insert(0, MODEL_SPECS["logistic_regression"])  # IV table comes from LR
+        results = [tune_model(spec, X, y, cv, s, pos_weight) for spec in specs]
+        comparison = pd.DataFrame([r.summary_row() for r in results]).sort_values(
+            "cv_f1", ascending=False, ignore_index=True
+        )
+        log_table(log, "model comparison (3-fold CV, best candidate per model)", comparison)
+        best = max(results, key=lambda r: r.cv_metrics["mean_f1"])
+        if "monitor" in ctx.stages and ctx.monitor_pool is None:
+            from src.monitoring.run import start_worker_pool
+
+            # Warm Evidently workers now; they import while the steps below run.
+            ctx.monitor_pool = start_worker_pool()
+        log.info(
+            "selected %s by CV F1 %.4f ± %.4f (ROC-AUC %.4f)",
+            best.spec.name,
+            best.cv_metrics["mean_f1"],
+            best.cv_metrics["std_f1"],
+            best.cv_metrics["mean_roc_auc"],
+        )
+
+        # One parallel batch: winner refit + its OOF folds (+ LR refit for the IV table).
+        lr = next(r for r in results if r.spec.name == "logistic_regression")
+        extra = {} if best is lr else {"logistic_regression": lr.template}
+        best.best_estimator, oof, refits = refit_with_oof(best.template, X, y, cv, extra)
+        lr.best_estimator = best.best_estimator if best is lr else refits["logistic_regression"]
+        log.info(
+            "refitted %s on %d rows + %d OOF folds in parallel", best.spec.name, len(X), s.n_splits
+        )
+
+        iv = lr.best_estimator.named_steps["woe"].iv_table_
+        log_table(log, f"WoE/IV ranking (LR refit on full train; drop IV < {s.iv_min})", iv)
+        log.info("IV kept %d / %d features", int(iv["selected"].sum()), len(iv))
+
+        deciles = decile_table(y, oof)
+        choice = choose_threshold(y, oof, deciles)
+        exp_id = tracking.result()
+
+    out = s.artifacts_dir
+    frames = {
+        out / "cv_comparison.csv": comparison,
+        out / "iv_table.csv": iv,
+        out / "train_decile_analysis.csv": deciles,
+    }
+    for path, frame in frames.items():
+        frame.to_csv(path, index=False, lineterminator="\n")
+        log_path_io(log, "write", path)
+
+    import mlflow
+
     with mlflow.start_run(run_name="training-pipeline", experiment_id=exp_id) as parent:
         log.info("MLflow parent run %s", parent.info.run_id)
         mlflow.set_tags({"stage": "train", **{f"version.{k}": v for k, v in ctx.versions.items()}})
@@ -93,65 +150,30 @@ def stage_train(ctx: Context) -> None:
                 "scale_pos_weight": round(pos_weight, 4),
             }
         )
-
-        specs = [MODEL_SPECS[m] for m in (ctx.models or MODEL_SPECS)]
-        if "logistic_regression" not in {sp.name for sp in specs}:
-            specs.insert(0, MODEL_SPECS["logistic_regression"])  # IV table comes from LR
-        results = [tune_model(spec, X, y, cv, s, pos_weight, exp_id) for spec in specs]
-        comparison = pd.DataFrame([r.summary_row() for r in results]).sort_values(
-            "cv_f1", ascending=False, ignore_index=True
-        )
-        log_table(log, "model comparison (3-fold CV, best candidate per model)", comparison)
-        best = max(results, key=lambda r: r.cv_metrics["mean_f1"])
-        log.info(
-            "selected %s by CV F1 %.4f ± %.4f (ROC-AUC %.4f)",
-            best.spec.name,
-            best.cv_metrics["mean_f1"],
-            best.cv_metrics["std_f1"],
-            best.cv_metrics["mean_roc_auc"],
-        )
-
-        lr = next(r for r in results if r.spec.name == "logistic_regression")
-        iv = lr.best_estimator.named_steps["woe"].iv_table_
-        log_table(log, f"WoE/IV ranking (LR refit on full train; drop IV < {s.iv_min})", iv)
-        log.info("IV kept %d / %d features", int(iv["selected"].sum()), len(iv))
-
-        oof = oof_probabilities(best.best_estimator, X, y, cv)
-        deciles = decile_table(y, oof)
-        choice = choose_threshold(y, oof, deciles)
-
-        out = s.artifacts_dir
-        frames = {
-            out / "cv_comparison.csv": comparison,
-            out / "iv_table.csv": iv,
-            out / "train_decile_analysis.csv": deciles,
-        }
-        for path, frame in frames.items():
-            frame.to_csv(path, index=False, lineterminator="\n")
-            log_path_io(log, "write", path)
+        for r in results:
+            log_child_run(r, exp_id, s.n_splits)
+        for path in frames:
             mlflow.log_artifact(str(path))
         for path in (out / "eda_summary.json", out / "eda_report.md"):
             if path.exists():
                 mlflow.log_artifact(str(path), artifact_path="eda")
-
         mlflow.set_tags({"best_model": best.spec.name, "best_family": best.spec.family})
         mlflow.log_params(
             {"best_model": best.spec.name, "optimal_threshold": round(choice.threshold, 6)}
         )
         mlflow.log_metrics({f"best_cv_{k}": v for k, v in best.cv_metrics.items()})
         mlflow.log_metrics({f"oof_{k}": v for k, v in choice.as_dict().items()})
-
         log_and_register(best, X, choice, s)
 
-        # Hand-off data for the batch client and monitoring (gitignored artifacts).
-        s.holdout_dir.mkdir(parents=True, exist_ok=True)
-        reference = ctx.train.copy()
-        reference["prediction_proba"] = oof
-        reference["prediction"] = (oof >= choice.threshold).astype(int)
-        for name, frame in (("train_reference", reference), ("test", ctx.test)):
-            path = s.holdout_dir / f"{name}.parquet"
-            frame.to_parquet(path, index=False)
-            log_path_io(log, "write", path)
+    # Hand-off data for the batch client and monitoring (gitignored artifacts).
+    s.holdout_dir.mkdir(parents=True, exist_ok=True)
+    reference = ctx.train.copy()
+    reference["prediction_proba"] = oof
+    reference["prediction"] = (oof >= choice.threshold).astype(int)
+    for name, frame in (("train_reference", reference), ("test", ctx.test)):
+        path = s.holdout_dir / f"{name}.parquet"
+        frame.to_parquet(path, index=False)
+        log_path_io(log, "write", path)
 
 
 def stage_evaluate(ctx: Context) -> None:
@@ -174,11 +196,18 @@ def stage_evaluate(ctx: Context) -> None:
     log.info("holdout metrics logged to run %s", run_id)
 
 
+def stage_monitor(ctx: Context) -> None:
+    from src.monitoring.run import run_monitoring
+
+    run_monitoring(ctx.settings, pool=ctx.monitor_pool)
+
+
 STAGES = {
     "ingest": stage_ingest,
     "eda": stage_eda,
     "train": stage_train,
     "evaluate": stage_evaluate,
+    "monitor": stage_monitor,
 }
 DEFAULT_STAGES = list(STAGES)
 
@@ -208,16 +237,20 @@ def main(argv: list[str] | None = None) -> None:
     models = [m.strip() for m in args.models.split(",")] if args.models else None
     if models and (bad := [m for m in models if m not in MODEL_SPECS]):
         parser.error(f"unknown models {bad}; choose from {list(MODEL_SPECS)}")
-    ctx = Context(settings=settings, models=models)
+    ctx = Context(settings=settings, models=models, stages=stages)
     start = time.perf_counter()
     with stage("setup"):
         ctx.versions = log_versions(log)
         log.info("working dir %s · stages %s", Path.cwd(), stages)
-    for name in stages:
-        t0 = time.perf_counter()
-        with stage(name):
-            STAGES[name](ctx)
-        ctx.timings.append({"stage": name, "seconds": time.perf_counter() - t0})
+    try:
+        for name in stages:
+            t0 = time.perf_counter()
+            with stage(name):
+                STAGES[name](ctx)
+            ctx.timings.append({"stage": name, "seconds": time.perf_counter() - t0})
+    finally:
+        if ctx.monitor_pool is not None:
+            ctx.monitor_pool.shutdown(cancel_futures=True)
     total = time.perf_counter() - start
     ctx.timings.append({"stage": "TOTAL", "seconds": total})
     with stage("summary"):
