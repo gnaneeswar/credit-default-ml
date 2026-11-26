@@ -147,3 +147,8 @@ def test_eda_artifacts(df: pd.DataFrame, tmp_path: Path) -> None:
     latest = checks["transition_counts"][-1]
     assert latest["transition"] == "PAY_2 -> PAY_1" and latest["dormant_to_revolver"] == 0
     assert "## Billing-cycle domain rules vs the data" in report
+    # M5: label-dependent statistics use the training split only; counts use the full data.
+    assert sum(r["count"] for r in summary["code_tables"]["EDUCATION"]) == 24000
+    assert seg["base"]["n"] == 24000
+    assert sum(summary["code_counts_full"]["EDUCATION"].values()) == 30000
+    assert summary["label_dependent_stats_on"] == "train split (n=24000)"

@@ -307,6 +307,11 @@ def _eda_slide(prs, inp: dict) -> None:
     named_edu = edu[edu["EDUCATION"].isin([1, 2, 3])]["default_rate"]
     code4 = float(edu.loc[edu["EDUCATION"] == 4, "default_rate"].iloc[0])
     mar0 = mar[mar["MARRIAGE"] == 0].iloc[0]
+    full = eda.get("code_counts_full", {})  # row counts: full data; default rates: train split
+    n_edu = sum(full.get("EDUCATION", {}).get(str(c), 0) for c in (0, 5, 6)) or int(
+        unk_edu["count"].sum()
+    )
+    n_mar = full.get("MARRIAGE", {}).get("0", int(mar0["count"]))
     top = iv.head(5)
     util = iv[iv["feature"].str.startswith("UTIL")].iloc[0]
     raw_bill_iv = iv[iv["feature"].str.startswith("BILL_AMT")]["iv"].max()
@@ -315,11 +320,11 @@ def _eda_slide(prs, inp: dict) -> None:
         f"{eda['total_missing']} missing values · {eda['duplicate_rows']} duplicate rows kept",
         f"Imbalanced target: {tb['default_rate_full']:.1%} default "
         f"({tb['imbalance_ratio_neg_to_pos']:.1f}:1) → F1 / PR-AUC + explicit cutoff",
-        f"EDUCATION {{0,5,6}}: {int(unk_edu['count'].sum())} rows "
-        f"({unk_edu['count'].sum() / sh['full'][0]:.2%}), default {unk_edu['default_rate'].min():.0%}–"
+        f"EDUCATION {{0,5,6}}: {n_edu} rows ({n_edu / sh['full'][0]:.2%}), train default "
+        f"{unk_edu['default_rate'].min():.0%}–"
         f"{unk_edu['default_rate'].max():.0%} ≈ code 4 ({code4:.1%}) vs codes 1–3 "
         f"{named_edu.min():.0%}–{named_edu.max():.0%} → remapped to 4",
-        f"MARRIAGE {{0}}: {int(mar0['count'])} rows, default {mar0['default_rate']:.1%} → "
+        f"MARRIAGE {{0}}: {n_mar} rows, train default {mar0['default_rate']:.1%} → "
         "merged into 3 'others' (too rare for its own level)",
         f"PAY_1: −2 inactive {pay[-2]:.1%} and 0 revolving {pay[0]:.1%} default less than "
         f"−1 paid in full {pay[-1]:.1%} → codes kept distinct",
@@ -391,11 +396,10 @@ def _prep_slide(prs, inp: dict) -> None:
     eda = inp["eda"]
     sh = eda["shapes"]
     rows_n, cols_n = sh["full"][0], sh["full"][1] - 1
-    edu = pd.DataFrame(eda["code_tables"]["EDUCATION"])
-    mar = pd.DataFrame(eda["code_tables"]["MARRIAGE"])
-    pay = pd.DataFrame(eda["code_tables"]["PAY_1"]).set_index("PAY_1")["count"]
-    n_edu = int(edu.loc[edu["EDUCATION"].isin([0, 5, 6]), "count"].sum())
-    n_mar = int(mar.loc[mar["MARRIAGE"] == 0, "count"].sum())
+    counts = eda["code_counts_full"]  # label-free, full data: rows affected by preprocessing
+    n_edu = sum(counts["EDUCATION"].get(str(c), 0) for c in (0, 5, 6))
+    n_mar = counts["MARRIAGE"].get("0", 0)
+    pay = {int(k): v for k, v in counts["PAY_1"].items()}
     min_limit = eda["numeric_distributions"]["LIMIT_BAL"]["min"]
     split = f"{sh['train'][0]:,} / {sh['test'][0]:,}"
     bullets = [
@@ -507,7 +511,9 @@ def _selection_slide(prs, inp: dict) -> None:
         },
         **best,
     }
-    top_group = gi.iloc[0]
+    total = gi[gi["kind"] == "total"]
+    cond = gi[gi["kind"] == "conditional"]
+    top_total, top_cond = total.iloc[0], cond.iloc[0]
     bullets = [
         f"Inputs: {len(iv)} model features = {len(FEATURES)} original + "
         f"{len(iv) - len(FEATURES)} engineered "
@@ -518,8 +524,9 @@ def _selection_slide(prs, inp: dict) -> None:
         f"regularised by {_fmt_params(reg)}",
         "Leak-free: selection re-fitted per training fold (tested); holdout used only for "
         "final scoring and importance",
-        f"Importance: model MDI per feature; holdout permutation per group — "
-        f"{top_group['group']} matters most (ΔROC-AUC {top_group['auc_drop_mean']:.3f})",
+        f"Holdout permutation ΔAUC — total (raw source shuffled through the pipeline): "
+        f"{top_total['group']} {top_total['auc_drop_mean']:.3f}; conditional (engineered "
+        f"group on top of all others): {top_cond['group']} {top_cond['auc_drop_mean']:.3f}",
     ]
     left_w, mid_w, gap = 4.4, 3.7, 0.3
     _textbox(
@@ -535,16 +542,17 @@ def _selection_slide(prs, inp: dict) -> None:
         "label:groups",
         bold=True,
     )
+    shown = pd.concat([total, cond.head(12 - len(total))])  # all raw sources + top engineered
     grows = [
-        [r.group, "orig." if r.origin == "original" else "eng.", f"{r.auc_drop_mean:.4f}"]
-        for r in gi.head(12).itertuples()
+        [r.group, "total" if r.kind == "total" else "cond.", f"{r.auc_drop_mean:.4f}"]
+        for r in shown.itertuples()
     ]
     _table(
         slide,
         Box(x_mid, TOP + 0.45, mid_w, BOTTOM - TOP - 0.45),
-        ["Feature group", "Type", "ΔROC-AUC"],
+        ["Feature group", "Kind", "ΔROC-AUC"],
         grows,
-        [2.05, 0.6, 1.05],
+        [2.0, 0.65, 1.05],
         "table:group_importance",
         cell_pt=DECILE_PT,
         header_h=0.42,

@@ -42,8 +42,10 @@ class TuneResult:
     cv_metrics: dict[str, float]  # mean_* and std_* for the best-F1 candidate
     candidates: pd.DataFrame
     seconds: float
-    best_estimator: Pipeline | None = None  # set only for refitted models
+    best_estimator: Pipeline | None = None  # full-train refit (set after fit_families)
     run_id: str | None = None
+    oof_f1_tuned: float | None = None  # OOF F1 at this family's own tuned cutoff
+    oof_threshold: float | None = None
 
     def summary_row(self) -> dict:
         row = {"model": self.spec.name, "family": self.spec.family}
@@ -52,6 +54,8 @@ class TuneResult:
         row["cv_f1_std"] = self.cv_metrics["std_f1"]
         row["n_candidates"] = self.spec.n_candidates
         row["seconds"] = self.seconds
+        row["oof_f1_tuned"] = self.oof_f1_tuned
+        row["oof_threshold"] = self.oof_threshold
         row["best_params"] = json.dumps(
             {k.removeprefix("model__"): v for k, v in self.best_params.items()}
         )

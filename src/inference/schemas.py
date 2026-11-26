@@ -12,11 +12,58 @@ is explicit rather than silently imputing.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Annotated
 
+import numpy as np
+import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, model_validator
 
 MAX_ROWS = 50_000
+MAX_ABS = 1e15  # checked before float conversion: huge ints must be a 422, not an OverflowError
+
+
+@dataclass(frozen=True)
+class Rule:
+    lo: float
+    hi: float
+    integral: bool = False
+    description: str = ""
+
+
+# Business contract per column (the API may not import src.data, so it lives here). Values
+# outside these ranges are rejected with 422 rather than silently scored.
+_PAY_STATUS = [f"PAY_{i}" for i in range(1, 7)]
+FEATURE_RULES: dict[str, Rule] = {
+    "LIMIT_BAL": Rule(1, 1e9, description="credit limit: 1 .. 1e9"),
+    "SEX": Rule(1, 2, integral=True, description="1 or 2"),
+    "EDUCATION": Rule(0, 6, integral=True, description="integer code 0..6"),
+    "MARRIAGE": Rule(0, 3, integral=True, description="integer code 0..3"),
+    "AGE": Rule(18, 100, integral=True, description="integer age 18..100"),
+    **{c: Rule(-2, 9, integral=True, description="integer status -2..9") for c in _PAY_STATUS},
+    **{f"BILL_AMT{i}": Rule(-1e9, 1e9, description="|bill| <= 1e9") for i in range(1, 7)},
+    **{f"PAY_AMT{i}": Rule(0, 1e9, description="payment: 0 .. 1e9") for i in range(1, 7)},
+}
+
+
+def rule_violations(frame: pd.DataFrame, limit: int = 20) -> tuple[int, list[dict]]:
+    """Vectorised business-range check. Returns (total violations, first ``limit`` details)."""
+    total, details = 0, []
+    for col, rule in FEATURE_RULES.items():
+        if col not in frame.columns:
+            continue
+        v = frame[col].to_numpy(dtype=float)
+        bad = (v < rule.lo) | (v > rule.hi)
+        if rule.integral:
+            bad |= v != np.round(v)
+        idx = np.flatnonzero(bad)
+        total += len(idx)
+        for i in idx[: max(0, limit - len(details))]:
+            details.append(
+                {"row": int(i), "column": col, "value": float(v[i]), "rule": rule.description}
+            )
+    return total, details
+
 
 Number = Annotated[StrictInt | StrictFloat, Field(description="finite numeric feature value")]
 
@@ -37,6 +84,8 @@ class DataFrameSplit(BaseModel):
         for i, row in enumerate(self.data):
             if len(row) != width:
                 raise ValueError(f"row {i} has {len(row)} values, expected {width}")
+            if any(abs(v) > MAX_ABS for v in row):
+                raise ValueError(f"row {i} has a value with magnitude above {MAX_ABS:g}")
             if not all(math.isfinite(v) for v in row):
                 raise ValueError(f"row {i} contains NaN or Infinity")
         if self.index is not None and len(self.index) != len(self.data):

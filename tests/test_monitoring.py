@@ -43,7 +43,9 @@ def test_covariate_drift_shifts_only_targeted_columns(small_xy) -> None:
     X, _ = small_xy
     shifted = drift.simulate_covariate_drift(X)
     assert (shifted["LIMIT_BAL"] < X["LIMIT_BAL"]).all()
-    assert (shifted[PAY_STATUS_COLS] == (X[PAY_STATUS_COLS] + 1).clip(upper=9)).all().all()
+    pay = X[PAY_STATUS_COLS].to_numpy()
+    expected = np.where(pay >= 0, np.minimum(pay + 1, 9), pay)  # -2 / -1 stay unchanged
+    np.testing.assert_array_equal(shifted[PAY_STATUS_COLS].to_numpy(), expected)
     assert shifted[PAY_STATUS_COLS].to_numpy().max() <= 9
     assert (shifted[BILL_AMT_COLS].abs() >= X[BILL_AMT_COLS].abs()).all().all()
     pd.testing.assert_frame_equal(shifted[PAY_AMT_COLS], X[PAY_AMT_COLS])
@@ -133,4 +135,26 @@ def test_run_monitoring_writes_reports_and_summary(small_xy, fitted, tmp_path, m
     assert by["concept_drift"]["classification"]["f1"] < by["holdout"]["classification"]["f1"]
     assert by["concept_drift"]["alerts"]["f1_drop"] is True
     assert not any(by["holdout"]["alerts"].values())
+    # Prediction-score drift: the downturn moves the score distribution, the holdout doesn't.
+    assert by["covariate_drift"]["score_psi"] > by["holdout"]["score_psi"]
+    assert by["holdout"]["score_psi"] < drift.SCORE_PSI_ALERT
     assert np.isfinite(by["holdout"]["classification"]["roc_auc"])
+
+
+def test_parse_survives_missing_drift_summary() -> None:
+    metrics = [
+        {
+            "config": {
+                "type": "evidently:metric_v2:ValueDrift",
+                "column": c,
+                "method": "wasserstein",
+                "threshold": 0.1,
+            },
+            "value": 0.5 if c == "LIMIT_BAL" else 0.01,
+        }
+        for c in FEATURES
+    ]
+    parsed = drift._parse({"metrics": metrics})  # no DriftedColumnsCount entry
+    assert parsed["drift"]["drifted_count"] == 1
+    assert parsed["drift"]["drift_share"] == pytest.approx(1 / len(FEATURES))
+    assert parsed["drift"]["drifted_columns"] == ["LIMIT_BAL"]

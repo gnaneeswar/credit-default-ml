@@ -23,6 +23,25 @@ log = get_logger(__name__)
 
 THRESHOLD_TAG = "optimal_threshold"
 
+# Single source of truth for skops-trusted types, used by BOTH the registry (at logging time)
+# and the serving loader (at load time). Pinned in code, never read from the model, so a
+# tampered MLmodel cannot widen what the API agrees to deserialise.
+SERVING_TRUSTED_PREFIXES = ("src.features.", "sklearn.", "xgboost.", "lightgbm.")
+# Exact standard-library container types some estimators persist (LightGBM: OrderedDict).
+# Plain data containers: loading them cannot execute code.
+SERVING_TRUSTED_EXACT = frozenset({"collections.OrderedDict"})
+
+
+def is_trusted(type_name: str) -> bool:
+    t = str(type_name)
+    return t in SERVING_TRUSTED_EXACT or t.startswith(SERVING_TRUSTED_PREFIXES)
+
+
+def check_trusted_types(types: list[str]) -> None:
+    rejected = [t for t in types if not is_trusted(t)]
+    if rejected:
+        raise RuntimeError(f"refusing to load model: untrusted skops types {rejected}")
+
 
 def quiet_mlflow() -> None:
     """Silence third-party deprecation chatter that would bury the pipeline narrative."""
@@ -82,6 +101,8 @@ class ChampionInfo:
     input_columns: list[str]
     input_types: dict[str, str]
     tags: dict[str, str]
+    model_uri: str = ""  # version-pinned, e.g. models:/credit-default-pipeline/3
+    trusted_types: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -95,7 +116,12 @@ class ChampionInfo:
 
 
 def champion_info(settings: Settings | None = None) -> ChampionInfo:
-    """Resolve ``@champion`` metadata: version, threshold tag, and the input signature."""
+    """Resolve ``@champion`` ONCE, then read everything from that pinned version.
+
+    The alias is looked up a single time; the signature, threshold and (in
+    ``load_champion``) the model all come from ``models:/<name>/<version>``, so a retrain that
+    moves the alias mid-load cannot pair version N+1's model with version N's threshold.
+    """
     import mlflow
     from mlflow import MlflowClient
 
@@ -104,7 +130,9 @@ def champion_info(settings: Settings | None = None) -> ChampionInfo:
     mv = MlflowClient().get_model_version_by_alias(settings.model_name, settings.model_alias)
     if THRESHOLD_TAG not in mv.tags:
         raise RuntimeError(f"model version {mv.version} has no '{THRESHOLD_TAG}' tag")
-    signature = mlflow.models.get_model_info(settings.model_uri).signature
+    model_uri = f"models:/{settings.model_name}/{mv.version}"
+    model_info = mlflow.models.get_model_info(model_uri)
+    signature = model_info.signature
     if signature is None:
         raise RuntimeError("champion model was logged without a signature")
     inputs = signature.inputs
@@ -117,17 +145,22 @@ def champion_info(settings: Settings | None = None) -> ChampionInfo:
         input_columns=list(inputs.input_names()),
         input_types={c.name: str(c.type) for c in inputs.inputs},
         tags=dict(mv.tags),
+        model_uri=model_uri,
+        trusted_types=tuple(
+            (model_info.flavors.get("sklearn") or {}).get("skops_trusted_types") or ()
+        ),
     )
 
 
 def load_champion(settings: Settings | None = None):
-    """Load ``models:/<name>@champion`` (sklearn flavor, skops format) and its metadata."""
+    """Load the ``@champion`` version (sklearn flavor, skops format) and its metadata."""
     import mlflow.sklearn
 
     settings = settings or get_settings()
     info = champion_info(settings)
-    log.info("loading %s (version %s, run %s)", settings.model_uri, info.version, info.run_id)
-    model = mlflow.sklearn.load_model(settings.model_uri)
+    check_trusted_types(list(info.trusted_types))
+    log.info("loading %s (@%s, run %s)", info.model_uri, info.alias, info.run_id)
+    model = mlflow.sklearn.load_model(info.model_uri)
     log.info(
         "loaded %s · threshold=%.4f · %d input columns",
         type(model).__name__,

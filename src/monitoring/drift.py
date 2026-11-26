@@ -36,6 +36,7 @@ DRIFT_SHARE_ALERT = 0.25
 F1_DROP_ALERT = 0.05
 ACCURACY_DROP_ALERT = 0.05
 CONCEPT_FLIP_RATE = 0.30
+SCORE_PSI_ALERT = 0.25  # PSI of model scores on the reference decile bands (> 0.25 = major)
 
 _CLASSIFICATION = {
     "F1Score": "f1",
@@ -48,11 +49,15 @@ _CLASSIFICATION = {
 
 # ------------------------------------------------------------------ scenarios
 def simulate_covariate_drift(features: pd.DataFrame) -> pd.DataFrame:
-    """Economic-downturn shift: lower limits, worse repayment status, higher balances."""
+    """Economic-downturn shift: lower limits, worse repayment status, higher balances.
+
+    Only revolving / delinquent statuses (PAY >= 0) roll one month worse; -2 (inactive) and
+    -1 (paid in full) are left as they are, since -2 -> -1 or -1 -> 0 is not "worse".
+    """
     out = features.copy()
     out["LIMIT_BAL"] = (out["LIMIT_BAL"] * 0.6).round()
     for col in PAY_STATUS_COLS:
-        out[col] = (out[col] + 1).clip(upper=9)
+        out[col] = np.where(out[col] >= 0, (out[col] + 1).clip(upper=9), out[col])
     for col in BILL_AMT_COLS:
         out[col] = (out[col] * 1.4).round()
     return out
@@ -99,7 +104,14 @@ def _parse(snapshot_dict: dict) -> dict[str, Any]:
             }
         elif kind in _CLASSIFICATION and isinstance(value, int | float):
             quality[_CLASSIFICATION[kind]] = float(value)
-    drift["drifted_columns"] = sorted(c for c, v in columns.items() if v["drifted"])
+    drifted = sorted(c for c, v in columns.items() if v["drifted"])
+    if not drift:  # Evidently did not emit DriftedColumnsCount: derive it, don't crash
+        drift = {
+            "drifted_count": len(drifted),
+            "drift_share": len(drifted) / len(FEATURES),
+            "summary_source": "derived from per-column drift",
+        }
+    drift["drifted_columns"] = drifted
     return {"drift": drift, "column_drift": columns, "classification": quality}
 
 
@@ -147,6 +159,21 @@ def score_batch(
     return out
 
 
+def score_psi(reference: pd.DataFrame, current: pd.DataFrame) -> float:
+    """Prediction-score drift: PSI of the current scores on the reference (OOF) decile bands.
+
+    Catches shifts in the model's output distribution, including ones driven by engineered
+    features that the raw-column drift tests cannot see.
+    """
+    from src.training.threshold import banded_decile_table, decile_table, population_stability_index
+
+    ref_bands = decile_table(reference[TARGET].to_numpy(), reference[PROBA].to_numpy())
+    cur_bands = banded_decile_table(
+        current[TARGET].to_numpy(), current[PROBA].to_numpy(), ref_bands
+    )
+    return population_stability_index(ref_bands["share"], cur_bands["share"])
+
+
 def evaluate_scenario(
     name: str,
     description: str,
@@ -170,6 +197,7 @@ def evaluate_scenario(
         snapshot.save_html(str(html_path))
     q = parsed["classification"]
     drift = parsed["drift"]
+    psi = score_psi(reference, current)
     f1_drop = baseline["f1"] - q.get("f1", np.nan)
     acc_drop = baseline["accuracy"] - q.get("accuracy", np.nan)
     return {
@@ -178,11 +206,13 @@ def evaluate_scenario(
         "n_rows": int(len(current)),
         "flagged_share": float(current[PRED].mean()),
         **drift,
+        "score_psi": psi,
         "classification": q,
         "f1_drop": float(f1_drop),
         "accuracy_drop": float(acc_drop),
         "alerts": {
             "data_drift": drift["drift_share"] >= DRIFT_SHARE_ALERT,
+            "score_drift": psi > SCORE_PSI_ALERT,
             "f1_drop": f1_drop > F1_DROP_ALERT,
             "accuracy_drop": acc_drop > ACCURACY_DROP_ALERT,
         },

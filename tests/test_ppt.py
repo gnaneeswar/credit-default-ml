@@ -76,6 +76,9 @@ def write_synthetic_artifacts(d: Path, holdout_f1: float = 0.6123) -> None:
             }
         },
     }
+    eda["code_counts_full"] = {  # label-free full-data counts (deck "rows affected")
+        col: {str(r[col]): r["count"] for r in rows} for col, rows in eda["code_tables"].items()
+    }
     (d / "eda_summary.json").write_text(json.dumps(eda))
     all_features = [*FEATURES, *ENGINEERED]
     ivs = np.r_[[0.88, 0.87, 0.85, 0.13], rng.uniform(0.0, 0.3, len(all_features) - 4)]
@@ -110,6 +113,7 @@ def write_synthetic_artifacts(d: Path, holdout_f1: float = 0.6123) -> None:
             "rank": range(1, len(groups) + 1),
             "group": groups,
             "origin": ["original"] * len(RAW_FEATURE_GROUPS) + ["engineered"] * len(FEATURE_GROUPS),
+            "kind": ["total"] * len(RAW_FEATURE_GROUPS) + ["conditional"] * len(FEATURE_GROUPS),
             "n_features": 3,
             "auc_drop_mean": np.linspace(0.016, 0.0, len(groups)),
             "auc_drop_std": 0.001,
@@ -328,8 +332,11 @@ def test_selection_slide_shows_steps_and_both_importances(deck) -> None:
     assert len(_table_rows(sl, "table:feature_importance")) == 13
     body = next(s for s in sl.shapes if s.name == "body").text_frame.text
     assert "IV ≥ 0.02" in body and "no pre-filter" in body
-    top_group = RAW_FEATURE_GROUPS[0][0]  # ranked first in the synthetic group importance
-    assert f"{top_group} matters most" in body
+    top_total = RAW_FEATURE_GROUPS[0][0]  # first "total" row in the synthetic importance
+    assert "total (raw source shuffled through the pipeline)" in body and top_total in body
+    kinds = [r[1] for r in _table_rows(sl, "table:group_importance")[1:]]
+    assert kinds[: len(RAW_FEATURE_GROUPS)] == ["total"] * len(RAW_FEATURE_GROUPS)
+    assert set(kinds[len(RAW_FEATURE_GROUPS) :]) == {"cond."}
 
 
 def test_compact_series() -> None:

@@ -68,13 +68,23 @@ def pay_bill_consistency(df: pd.DataFrame) -> pd.DataFrame:
 SEGMENTS = {
     # name: (description, mask over engineered features `f` and raw frame `df`)
     "never_late": ("no month with PAY_n > 0", lambda f, df: f["N_DELINQ"] == 0),
+    # Counts cover the history transitions and *_RECENT the latest one, so "any" = either.
     "cured_now_current": (
         "had a cure (PAY_(n+1) >= 2 -> PAY_n <= 0) and PAY_1 <= 0",
-        lambda f, df: (f["N_CURES"] > 0) & (df["PAY_1"] <= 0),
+        lambda f, df: ((f["N_CURES"] > 0) | (f["CURED_RECENT"] > 0)) & (df["PAY_1"] <= 0),
     ),
-    "roll_forward": ("any worsening into delinquency", lambda f, df: f["N_ROLL_FWD"] > 0),
-    "roll_backward": ("any improvement while past due", lambda f, df: f["N_ROLL_BACK"] > 0),
-    "stagnant": ("stuck at the same PAY >= 2", lambda f, df: f["N_STAGNANT"] > 0),
+    "roll_forward": (
+        "any worsening into delinquency",
+        lambda f, df: (f["N_ROLL_FWD"] > 0) | (f["ROLL_FWD_RECENT"] > 0),
+    ),
+    "roll_backward": (
+        "any improvement while past due",
+        lambda f, df: (f["N_ROLL_BACK"] > 0) | (f["ROLL_BACK_RECENT"] > 0),
+    ),
+    "stagnant": (
+        "stuck at the same PAY >= 2",
+        lambda f, df: (f["N_STAGNANT"] > 0) | (f["STAGNANT_RECENT"] > 0),
+    ),
     "dormant_to_revolver": ("any -2 -> 0 activation", lambda f, df: f["N_DORMANT_TO_REVOLVER"] > 0),
     "over_limit": ("any BILL_AMT_n > LIMIT_BAL", lambda f, df: f["N_OVER_LIMIT"] > 0),
     "credit_balance": ("any BILL_AMT_n < 0", lambda f, df: f["N_CREDIT_BAL"] > 0),
@@ -82,17 +92,22 @@ SEGMENTS = {
 }
 
 
-def domain_rule_checks(df: pd.DataFrame) -> dict:
-    """Test the billing-cycle domain rules against the data (descriptive, full dataset).
+def domain_rule_checks(df: pd.DataFrame, labelled: pd.DataFrame | None = None) -> dict:
+    """Test the billing-cycle domain rules against the data.
 
+    Label-free checks (status-code counts, timing alignment, inactive vs bill, transition
+    counts) use ``df``. Label-dependent ones (segment default rates) use ``labelled`` — the
+    training split in the pipeline — so holdout labels never inform design decisions.
     Segments are defined through DomainFeatureEngineer outputs, so the EDA and the model
     share a single definition of every rule.
     """
     from src.features.domain import DomainCleaner, DomainFeatureEngineer
 
-    X = df[schema.FEATURES]
-    f = DomainFeatureEngineer().fit_transform(DomainCleaner().fit_transform(X))
-    y = df[schema.TARGET]
+    labelled = df if labelled is None else labelled
+    f = DomainFeatureEngineer().fit_transform(
+        DomainCleaner().fit_transform(labelled[schema.FEATURES])
+    )
+    y = labelled[schema.TARGET]
 
     timing = []
     for k, col in enumerate(schema.PAY_STATUS_COLS, start=1):
@@ -117,9 +132,11 @@ def domain_rule_checks(df: pd.DataFrame) -> dict:
         for p, b in zip(schema.PAY_STATUS_COLS, schema.BILL_AMT_COLS, strict=True)
     ]
 
-    segments = {"base": {"description": "all rows", "n": len(df), "default_rate": float(y.mean())}}
+    segments = {
+        "base": {"description": "all rows", "n": len(labelled), "default_rate": float(y.mean())}
+    }
     for name, (desc, rule) in SEGMENTS.items():
-        m = rule(f, df)
+        m = rule(f, labelled)
         segments[name] = {
             "description": desc,
             "n": int(m.sum()),
@@ -156,8 +173,10 @@ def domain_rule_checks(df: pd.DataFrame) -> dict:
 
 
 def build_summary(df: pd.DataFrame, train: pd.DataFrame, test: pd.DataFrame) -> dict:
+    """Label-free statistics use the full data; anything computed from the target (default
+    rates by code, segments, PAY consistency) uses the TRAINING split only."""
     target = df[schema.TARGET]
-    codes = {c: code_table(df, c) for c in _DOCUMENTED}
+    codes = {c: code_table(train, c) for c in _DOCUMENTED}
     undocumented = {
         c: {
             str(int(r[c])): {"count": int(r["count"]), "default_rate": round(r["default_rate"], 4)}
@@ -192,15 +211,20 @@ def build_summary(df: pd.DataFrame, train: pd.DataFrame, test: pd.DataFrame) -> 
         ),
         "negative_bill_rows": int((df[schema.BILL_AMT_COLS] < 0).any(axis=1).sum()),
         "zero_bill_all_months_rows": int((df[schema.BILL_AMT_COLS] == 0).all(axis=1).sum()),
+        "label_dependent_stats_on": f"train split (n={len(train)})",
+        "code_counts_full": {
+            c: {str(int(k)): int(v) for k, v in df[c].value_counts().sort_index().items()}
+            for c in _DOCUMENTED
+        },
         "code_tables": {
             c: json.loads(t.round(4).to_json(orient="records")) for c, t in codes.items()
         },
         "undocumented_codes": undocumented,
         "pay_status_definitions": schema.PAY_STATUS_DEFINITIONS,
         "pay_code_bill_consistency": json.loads(
-            pay_bill_consistency(df).round(4).to_json(orient="records")
+            pay_bill_consistency(train).round(4).to_json(orient="records")
         ),
-        "domain_rule_checks": domain_rule_checks(df),
+        "domain_rule_checks": domain_rule_checks(df, labelled=train),
     }
 
 
@@ -280,6 +304,10 @@ def render_report(summary: dict, codes: dict[str, pd.DataFrame]) -> str:
         "",
         "## Undocumented codes (evidence for handling decisions)",
         "",
+        f"Default rates below use the {summary['label_dependent_stats_on']} only: the 20%",
+        "holdout's labels never inform design decisions. Row counts of the preprocessing",
+        "steps use the full data (`code_counts_full`).",
+        "",
     ]
     for col in ("EDUCATION", "MARRIAGE"):
         lines += [f"### {col}", "", render_table(codes[col]), ""]
@@ -329,7 +357,7 @@ def run_eda(df: pd.DataFrame | None = None, settings: Settings | None = None) ->
     df = load_dataset(settings) if df is None else df
     train, test = train_test(df, settings)
     summary = build_summary(df, train, test)
-    codes = {c: code_table(df, c) for c in _DOCUMENTED}
+    codes = {c: code_table(train, c) for c in _DOCUMENTED}  # label-dependent: train only
 
     tb = summary["target_balance"]
     log.info(
