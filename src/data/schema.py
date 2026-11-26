@@ -20,6 +20,20 @@ PAY_AMT_COLS = [f"PAY_AMT{i}" for i in range(1, 7)]
 DEMOGRAPHIC_COLS = ["SEX", "EDUCATION", "MARRIAGE", "AGE"]
 
 FEATURES = ["LIMIT_BAL", *DEMOGRAPHIC_COLS, *PAY_STATUS_COLS, *BILL_AMT_COLS, *PAY_AMT_COLS]
+
+# Feature catalogue for reports: (group, columns, description). Covers FEATURES exactly once.
+RAW_FEATURE_GROUPS: list[tuple[str, list[str], str]] = [
+    ("Credit limit", ["LIMIT_BAL"], "Credit limit (NT$), incl. family / supplementary cards"),
+    ("Demographics", DEMOGRAPHIC_COLS, "Sex, education, marital status, age (years)"),
+    (
+        "Repayment status",
+        PAY_STATUS_COLS,
+        "Status per month (1 = Sep … 6 = Apr): -2 inactive, -1 paid in full, 0 revolving, "
+        "1–9 missed due dates",
+    ),
+    ("Bill amounts", BILL_AMT_COLS, "Statement balance at cycle close (NT$); negative = credit"),
+    ("Payments", PAY_AMT_COLS, "Cash received in calendar month n (NT$)"),
+]
 CATEGORICAL_CODE_COLS = ["SEX", "EDUCATION", "MARRIAGE", *PAY_STATUS_COLS]
 
 RAW_TO_CANONICAL: dict[str, str] = {f"X{i}": name for i, name in enumerate(FEATURES, start=1)}

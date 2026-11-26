@@ -180,3 +180,21 @@ def test_banded_deciles_reproduce_reference_and_measure_stability() -> None:
     assert shifted["n"].sum() == len(y) and shifted.loc[9, "n"] == 0
     assert np.isfinite(shifted[["bad_rate", "lift", "cum_lift"]].to_numpy()).all()
     assert population_stability_index(ref["share"], shifted["share"]) > 0.25
+
+
+def test_feature_and_group_importance(small_xy) -> None:
+    from src.features.domain import FEATURE_GROUPS
+    from src.training.evaluate import feature_importance, group_importance
+
+    X, y = small_xy
+    model = lr_pipeline().fit(X, y)
+    fi = feature_importance(model)
+    assert fi["importance_type"].iloc[0] == "|coefficient|"
+    assert fi["feature"].str.startswith("WOE_").all() and "other" not in set(fi["group"])
+    assert fi["importance"].is_monotonic_decreasing and list(fi["rank"]) == list(
+        range(1, len(fi) + 1)
+    )
+    gi = group_importance(model, X, y.to_numpy(), n_repeats=2)
+    assert gi["auc_drop_mean"].is_monotonic_decreasing
+    assert len(gi) <= 5 + len(FEATURE_GROUPS)  # groups fully dropped by IV are skipped
+    assert gi.iloc[0]["auc_drop_mean"] > 0  # shuffling the strongest group hurts AUC
