@@ -10,7 +10,7 @@ Binning (all features are numeric/ordinal in this dataset):
   month counts) start with one bin per value; others start with up to ``max_bins`` quantile
   bins;
 * bins holding < ``min_bin_frac`` of rows are merged into their smaller adjacent neighbour,
-  so each WoE estimate rests on enough rows (e.g. PAY_0 delays 4..8 merge into "3+").
+  so each WoE estimate rests on enough rows (e.g. PAY_1 delays 4..8 merge into "3+").
 
 WoE_i = ln(%good_i / %bad_i) with additive (Laplace) smoothing ``alpha``; higher = safer.
 IV = sum_i (%good_i - %bad_i) * WoE_i. Features with IV < ``iv_min`` are dropped.

@@ -85,12 +85,21 @@ def build_dictionary(metadata: dict, variables: list[dict]) -> dict:
             {**_to_jsonable(v), "canonical_name": canonical[v["name"]]} for v in variables
         ],
         "canonical_mapping": schema.RAW_TO_CANONICAL,
+        "uci_original_names": schema.UCI_ORIGINAL_NAMES,
         "timeline": schema.TIMELINE,
+        "target_month": schema.TARGET_MONTH,
         "documented_codes": _to_jsonable(schema.DOCUMENTED_CODES),
         "undocumented_codes": schema.UNDOCUMENTED_CODES,
         "pay_status_definitions": {
             "source": schema.PAY_STATUS_DEFINITIONS_SOURCE,
             "definitions": schema.PAY_STATUS_DEFINITIONS,
+        },
+        "billing_mechanics": {
+            "source": schema.DOMAIN_RULES_SOURCE,
+            "billing_cycle": schema.BILLING_CYCLE,
+            "delinquency_progression": schema.DELINQUENCY_PROGRESSION,
+            "accounting_rules": schema.ACCOUNTING_RULES,
+            "empirical_check": schema.EMPIRICAL_CHECK_NOTE,
         },
         "uci_variable_info": (metadata.get("additional_info") or {}).get("variable_info"),
         "source_metadata": metadata,
@@ -156,11 +165,15 @@ def render_dictionary_md(d: dict) -> str:
         f"| {t['month']} | `{t['pay_status']}` | `{t['bill_amt']}` | `{t['pay_amt']}` |"
         for t in d["timeline"]
     ]
+    renamed = ", ".join(
+        f"`{canon}` (UCI: `{orig}`)" for canon, orig in d["uci_original_names"].items()
+    )
     lines += [
         "",
-        "Note: `PAY_AMTn` is the amount paid *in* month n; it is conventionally read as settling "
-        "the prior statement (`BILL_AMT(n+1)`), which is how payment-coverage ratios are built. "
-        "There is no `PAY_1` in the original data.",
+        f"Target `{d['target']['canonical']}` refers to **{d['target_month']}**. "
+        f"Renamed on load for consistent 1-6 indexing: {renamed}. `PAY_AMTn` is cash received "
+        "*in* calendar month n; it largely settles the prior statement (`BILL_AMT(n+1)`), which "
+        "is how payment-coverage ratios are built.",
         "",
         "## Documented codes",
         "",
@@ -189,12 +202,38 @@ def render_dictionary_md(d: dict) -> str:
         f"| `{x['code']}` | {x['meaning']} | {x['financial_behavior']} |"
         for x in psd["definitions"]
     ]
+    bm = d["billing_mechanics"]
+    bc = bm["billing_cycle"]
+    lines += ["", f"## Billing-cycle mechanics ({bm['source']})", ""]
+    lines += [f"- {r}" for r in bc["rules"]]
     lines += [
         "",
-        "Observed caveat: `-2` does not always coincide with a zero same-month bill (a balance,",
-        "fees or a credit can still appear), so status codes and bill amounts are kept as",
-        "separate signals — see `pay_code_bill_consistency` in `artifacts/eda_summary.json`.",
+        f"Illustrative cycle: {bc['example_cycle']}.",
+        "",
+        "| Statement | Covers | Closes | Due | Note |",
+        "|---|---|---|---|---|",
     ]
+    lines += [
+        f"| {e['statement']} | {e['covers']} | {e['closes']} | {e['due']} | {e['note']} |"
+        for e in bc["example"]
+    ]
+    lines += ["", "Calendar-month cash flow:", ""]
+    lines += [f"- {c}" for c in bc["cash_flow"]]
+    lines += [
+        "",
+        "### Multi-month delinquency progression (purchase Aug 14, no payments afterwards)",
+        "",
+        "| Statement date | Cycle | Due | Missed due dates | Status | Explanation |",
+        "|---|---|---|---|---|---|",
+    ]
+    lines += [
+        f"| {r['statement_date']} | {r['cycle']} | {r['due']} | {r['missed_due_dates']} "
+        f"| `{r['status']}` | {r['explanation']} |"
+        for r in bm["delinquency_progression"]
+    ]
+    lines += ["", "### Accounting rules (n = 1..6)", ""]
+    lines += [f"- **`{k}`**: {v}" for k, v in bm["accounting_rules"].items()]
+    lines += ["", "### Empirical check", "", bm["empirical_check"]]
     lines += ["", "## UCI variable information (verbatim)", "", "```", d["uci_variable_info"]]
     lines += ["```", ""]
     return "\n".join(lines)

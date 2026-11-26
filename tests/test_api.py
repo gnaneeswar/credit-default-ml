@@ -22,7 +22,7 @@ class FakeModel:
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         assert list(X.columns) == FEATURES, "app must reorder columns to the signature"
         assert all(dt == np.float64 for dt in X.dtypes), "app must cast to float64"
-        p = np.clip((X["PAY_0"].to_numpy() + 2) / 10, 0, 1)
+        p = np.clip((X["PAY_1"].to_numpy() + 2) / 10, 0, 1)
         return np.column_stack([1 - p, p])
 
 
@@ -44,9 +44,9 @@ def client() -> TestClient:
         yield c
 
 
-def _row(pay_0: int = 0) -> list[int]:
+def _row(pay_1: int = 0) -> list[int]:
     row = dict.fromkeys(FEATURES, 1000)
-    row.update(SEX=1, EDUCATION=2, MARRIAGE=1, AGE=30, PAY_0=pay_0)
+    row.update(SEX=1, EDUCATION=2, MARRIAGE=1, AGE=30, PAY_1=pay_1)
     return [row[c] for c in FEATURES]
 
 
@@ -111,7 +111,7 @@ def test_invocations_accepts_floats(client: TestClient) -> None:
         (_payload([[True, *_row()[1:]]]), "int"),
         (_payload([[None, *_row()[1:]]]), "int"),
         (_payload([]), "at least 1"),
-        (_payload([[*_row(), 1]], [*FEATURES[:-1], "PAY_0", "PAY_0"]), "duplicate columns"),
+        (_payload([[*_row(), 1]], [*FEATURES[:-1], "PAY_1", "PAY_1"]), "duplicate columns"),
         (_payload([_row()], index=[1, 2]), "index has 2 ids"),
         ({"columns": FEATURES, "data": [_row()]}, "dataframe_split"),
         ({**_payload([_row()]), "extra": 1}, "extra"),

@@ -11,10 +11,18 @@ Plan: leak-free credit-default pipeline (UCI 350) → MLflow registry `@champion
 - [x] P5 Monitoring — Evidently drift + classification scenarios, report html + summary json
 - [x] P6 Docker + README + push — Dockerfile.train/serve, compose, sample_request.json, Design Decisions
 
+## Branch `feat/domain-billing-features` (from main @ bfc33f6)
+- [x] B1 PAY_0 -> PAY_1 rename; billing-cycle domain rules in schema/dictionary; EDA `domain_rule_checks`; 23 new accounting + roll-rate features (45 -> 68 total); tests
+- [ ] B2 `src/reporting/ppt.py` deck + `report` stage; README update; Docker verification; merge to main
+
 ## Next steps
-- All phases complete. Optional follow-ups (README §11): cost-based threshold, calibration, SEX fairness audit/drop, champion/challenger promotion gate, train/serve dependency groups for a leaner serve image.
+- B2: python-pptx deck (cover + 4 slides, data from artifacts; new artifacts model_grids.json, train_oof_metrics.json, best_params in cv_comparison.csv), tests/test_ppt.py; README data-dictionary + Design Decisions update incl. impact table; clean docker compose run; /checkpoint; merge --no-ff to main.
 
 ## Open issues / notes
+- B1 results vs main (holdout F1 0.5379 -> 0.5468, +0.009; RF CV F1 0.5460 -> 0.5493; XGB 0.5420 -> 0.5447; precision +0.021, recall -0.008; ROC 0.777 -> 0.780; PR 0.553 -> 0.558). Runtime unchanged (41.4s pipeline / 46.3s wall). IV kept 55/68; 5 of IV top-12 are new (MAX_DELINQ_STREAK 0.85, N_STAGNANT 0.57, N_ROLL_FWD 0.48, MAX_ROLL_FWD_STEP 0.48, STAGNANT_RECENT 0.38). Dropped for LR: OVER_LIMIT_1, N_CREDIT_BAL, CURED_RECENT, N_DORMANT_TO_REVOLVER, HAS_CREDIT_BAL_1, MIN_CREDIT_BAL_RATIO (sparse; trees keep them).
+- Domain rule checks: brief's risk ordering confirmed (never-late 11.7% < cured 26.9% < roll-fwd 42.0% < roll-back 47.3% < stagnant 57.0%; credit bal 16.5%, paydown 15.7%, over-limit 30.1%, dormant->revolver 18.2%). Brief's §4 timing (75-80%) vs next-month pairing (98-99%) and -2=>bill<=0 (33-71%) documented as rule + empirical check (user decision).
+- DATA QUIRK: code 1 appears 3,688x in PAY_1 but 28/4/2/0/0 in PAY_2..PAY_6 (source coded latest month differently) -> latest transition has 1,922 roll-backs vs 74-161 elsewhere; -2->0 never occurs PAY_2->PAY_1 (no recent flag). MAX_ROLL_FWD_STEP max is 2 in data.
+- Deviations confirmed by user: roll-forward requires PAY_n >= 1, step from max(prev,0); -2->0 = separate N_DORMANT_TO_REVOLVER.
 - P6 verified on Docker 29.10.1 / Compose v5.8: clean `docker compose up --build` (train exit 0 → serve healthy; curl + `--profile score` batch F1 0.5379 identical to host) and README Option B verbatim. Pipeline 41-45s in container, ~50-52s container wall (≈5s fixed start/exit). Images 2.47 GB (shared layers), train peak 2.93 GiB RAM (12 workers), serve ~290 MB. Serve image has no data/ or src/training. Outputs owned by host UID 1000.
 - Docker access in this session came from `setfacl -m u:$USER:rw /var/run/docker.sock` (resets on docker restart; a fresh login picks up the docker group permanently).
 - `mlruns/.gitkeep` committed (like artifacts/) so bind-mount dirs exist user-owned on clone; `git clean -fdX mlruns artifacts` resets outputs.

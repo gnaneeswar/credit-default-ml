@@ -22,9 +22,11 @@ def df() -> pd.DataFrame:
 
 def test_mapping_follows_uci_naming() -> None:
     m = schema.RAW_TO_CANONICAL
-    assert m["X1"] == "LIMIT_BAL" and m["X6"] == "PAY_0" and m["X7"] == "PAY_2"
+    assert m["X1"] == "LIMIT_BAL" and m["X6"] == "PAY_1" and m["X7"] == "PAY_2"
     assert m["X12"] == "BILL_AMT1" and m["X23"] == "PAY_AMT6" and m["Y"] == schema.TARGET
-    assert "PAY_1" not in schema.FEATURES
+    # Standardised 1..6 indexing: UCI's PAY_0 is renamed to PAY_1 on load.
+    assert schema.PAY_STATUS_COLS == ["PAY_1", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6"]
+    assert "PAY_0" not in schema.FEATURES and schema.UCI_ORIGINAL_NAMES == {"PAY_1": "PAY_0"}
     assert len(schema.FEATURES) == 23 and len(set(schema.FEATURES)) == 23
 
 
@@ -60,8 +62,13 @@ def test_data_dictionary_is_complete_and_regenerable() -> None:
     d = json.loads(REPO.dictionary_json.read_text(encoding="utf-8"), parse_constant=_reject_nan)
     assert "\r" not in REPO.dictionary_md.read_bytes().decode("utf-8")
     assert d["dataset"]["uci_id"] == 350
-    assert d["canonical_mapping"]["X6"] == "PAY_0"
-    assert [t["month"] for t in d["timeline"]][0] == "2005-09"
+    assert d["canonical_mapping"]["X6"] == "PAY_1"
+    assert d["uci_original_names"] == {"PAY_1": "PAY_0"}
+    assert [t["month"] for t in d["timeline"]][0] == "2005-09" and d["target_month"] == "2005-10"
+    bm = d["billing_mechanics"]
+    assert len(bm["delinquency_progression"]) == 4
+    assert set(bm["accounting_rules"]) == {"BILL_AMT_n", "PAY_AMT_n", "PAY_n"}
+    assert "domain_rule_checks" in bm["empirical_check"]
     assert {v["canonical_name"] for v in d["variables"]} >= set(schema.FEATURES)
     assert d["undocumented_codes"]["PAY_n"]["codes"] == [-2, 0]
     # The markdown is a pure rendering of the JSON, so it can be rebuilt offline.
@@ -71,8 +78,14 @@ def test_data_dictionary_is_complete_and_regenerable() -> None:
 def test_pay_status_definitions_in_dictionary() -> None:
     d = json.loads(REPO.dictionary_json.read_text(encoding="utf-8"))
     defs = {x["code"]: x["meaning"] for x in d["pay_status_definitions"]["definitions"]}
-    assert defs == {-2: "No consumption", -1: "Paid in full", 0: "Revolving credit"}
-    assert "Revolving credit" in REPO.dictionary_md.read_text(encoding="utf-8")
+    assert defs == {
+        -2: "Inactive cycle",
+        -1: "Paid in full",
+        0: "Revolving / minimum met",
+        "1..9": "Delinquent",
+    }
+    md = REPO.dictionary_md.read_text(encoding="utf-8")
+    assert "Revolving / minimum met" in md and "## Billing-cycle mechanics" in md
 
 
 def test_dictionary_rebuilds_offline_idempotently(tmp_path: Path) -> None:
@@ -113,5 +126,24 @@ def test_eda_artifacts(df: pd.DataFrame, tmp_path: Path) -> None:
     assert all(set(u[c]) == {"-2", "0"} for c in schema.PAY_STATUS_COLS)
     cons = pd.DataFrame(summary["pay_code_bill_consistency"])
     assert len(cons) == 6 * 3
-    revolving = cons[(cons["pay_col"] == "PAY_0") & (cons["code"] == 0)].iloc[0]
+    revolving = cons[(cons["pay_col"] == "PAY_1") & (cons["code"] == 0)].iloc[0]
     assert revolving["share_bill_le_0"] < 0.01  # revolving => a balance exists
+
+    checks = summary["domain_rule_checks"]
+    assert {
+        "status_code_counts",
+        "timing_alignment",
+        "inactive_vs_bill",
+        "segments",
+        "transition_counts",
+    } <= set(checks)
+    seg = checks["segments"]
+    # Brief's risk ordering holds: never-late < cured < roll-forward < stagnant.
+    assert seg["never_late"]["default_rate"] < seg["cured_now_current"]["default_rate"]
+    assert seg["cured_now_current"]["default_rate"] < seg["roll_forward"]["default_rate"]
+    assert seg["roll_forward"]["default_rate"] < seg["stagnant"]["default_rate"]
+    assert seg["credit_balance"]["default_rate"] < seg["base"]["default_rate"]
+    assert seg["over_limit"]["default_rate"] > seg["base"]["default_rate"]
+    latest = checks["transition_counts"][-1]
+    assert latest["transition"] == "PAY_2 -> PAY_1" and latest["dormant_to_revolver"] == 0
+    assert "## Billing-cycle domain rules vs the data" in report
