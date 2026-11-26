@@ -8,6 +8,7 @@ out-of-fold predictions (see ``threshold.refit_with_oof``).
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 
@@ -51,6 +52,9 @@ class TuneResult:
         row["cv_f1_std"] = self.cv_metrics["std_f1"]
         row["n_candidates"] = self.spec.n_candidates
         row["seconds"] = self.seconds
+        row["best_params"] = json.dumps(
+            {k.removeprefix("model__"): v for k, v in self.best_params.items()}
+        )
         return row
 
 

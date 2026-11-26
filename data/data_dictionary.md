@@ -112,7 +112,7 @@ Calendar-month cash flow:
 
 ### Empirical check
 
-The rules above are the project's domain definition. The EDA tests them against the data (artifacts/eda_summary.json -> domain_rule_checks). Two measured deviations: (1) a 'paid in full' status in month k is confirmed by statement k being covered by the following month's payment (PAY_AMT_(k-1) >= BILL_AMT_k) in ~98-99% of rows, versus ~75-80% for the section-4 pairing (PAY_AMT_k >= BILL_AMT_(k+1)), i.e. the data aligns status codes one month later than the rule; (2) '-2 => BILL_AMT_n <= 0' holds for only ~33-71% of -2 rows. Neither affects the engineered features, which use the status sequence and per-month amounts directly. Timing caveat: under the rule PAY_1 holds no October information; under the data's alignment it may partly reflect October payments (an ablation without PAY_1's information costs about 0.04 CV F1).
+The rules above are the project's domain definition. The EDA tests them against the data (artifacts/eda_summary.json -> domain_rule_checks). Two measured deviations: (1) a 'paid in full' status in month k is confirmed by statement k being covered by the following month's payment (PAY_AMT_(k-1) >= BILL_AMT_k) in ~98-99% of rows, versus ~73-80% for the section-4 pairing (PAY_AMT_k >= BILL_AMT_(k+1)), i.e. the data aligns status codes one month later than the rule; (2) '-2 => BILL_AMT_n <= 0' holds for only ~33-71% of -2 rows. Neither affects the engineered features, which use the status sequence and per-month amounts directly. Timing caveat: under the rule PAY_1 holds no October information; under the data's alignment it may partly reflect October payments (an ablation without PAY_1's information costs about 0.04 CV F1).
 
 ## UCI variable information (verbatim)
 

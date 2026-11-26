@@ -13,12 +13,13 @@ Plan: leak-free credit-default pipeline (UCI 350) → MLflow registry `@champion
 
 ## Branch `feat/domain-billing-features` (from main @ bfc33f6)
 - [x] B1 PAY_0 -> PAY_1 rename; billing-cycle domain rules in schema/dictionary; EDA `domain_rule_checks`; 23 new accounting + roll-rate features (45 -> 68 total); tests
-- [ ] B2 `src/reporting/ppt.py` deck + `report` stage; README update; Docker verification; merge to main
+- [x] B2 `src/reporting/ppt.py` deck + `report` stage; README update; Docker verification; merge to main
 
 ## Next steps
-- B2: python-pptx deck (cover + 4 slides, data from artifacts; new artifacts model_grids.json, train_oof_metrics.json, best_params in cv_comparison.csv), tests/test_ppt.py; README data-dictionary + Design Decisions update incl. impact table; clean docker compose run; /checkpoint; merge --no-ff to main.
+- Branch merged to main. Optional follow-ups (README §11): cost-based threshold, calibration, SEX fairness audit/drop, champion/challenger gate, train/serve dependency groups; compare one-hot / LightGBM-native categorical encoding for PAY_n.
 
 ## Open issues / notes
+- B2 verified: deck (cover + 4 slides) built from artifacts in 0.3s, geometry/fit checks pass on real data (no overlaps, all in bounds); clean `docker compose up --build`: train exit 0, pipeline 46.0s / container 52.9s (baseline 45.2 / 51.6), holdout F1 0.5468 identical to host; serve healthy; sample request p=0.943 flagged; PAY_0 payload -> 422 missing [PAY_1] unknown [PAY_0]; batch F1 0.5468. 106 tests.
 - B1 results vs main (holdout F1 0.5379 -> 0.5468, +0.009; RF CV F1 0.5460 -> 0.5493; XGB 0.5420 -> 0.5447; precision +0.021, recall -0.008; ROC 0.777 -> 0.780; PR 0.553 -> 0.558). Runtime unchanged (41.4s pipeline / 46.3s wall). IV kept 55/68; 5 of IV top-12 are new (MAX_DELINQ_STREAK 0.85, N_STAGNANT 0.57, N_ROLL_FWD 0.48, MAX_ROLL_FWD_STEP 0.48, STAGNANT_RECENT 0.38). Dropped for LR: OVER_LIMIT_1, N_CREDIT_BAL, CURED_RECENT, N_DORMANT_TO_REVOLVER, HAS_CREDIT_BAL_1, MIN_CREDIT_BAL_RATIO (sparse; trees keep them).
 - Domain rule checks: brief's risk ordering confirmed (never-late 11.7% < cured 26.9% < roll-fwd 42.0% < roll-back 47.3% < stagnant 57.0%; credit bal 16.5%, paydown 15.7%, over-limit 30.1%, dormant->revolver 18.2%). Brief's §4 timing (75-80%) vs next-month pairing (98-99%) and -2=>bill<=0 (33-71%) documented as rule + empirical check (user decision).
 - DATA QUIRK: code 1 appears 3,688x in PAY_1 but 28/4/2/0/0 in PAY_2..PAY_6 (source coded latest month differently) -> latest transition has 1,922 roll-backs vs 74-161 elsewhere; -2->0 never occurs PAY_2->PAY_1 (no recent flag). MAX_ROLL_FWD_STEP max is 2 in data.

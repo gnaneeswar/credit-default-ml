@@ -33,6 +33,9 @@ class ModelSpec:
     family: str
     build: Callable[[Settings, float], Pipeline]
     grid: dict[str, list]
+    display: str = ""
+    preprocessing: str = ""
+    imbalance: str = ""
 
     @property
     def n_candidates(self) -> int:
@@ -40,6 +43,45 @@ class ModelSpec:
         for values in self.grid.values():
             n *= len(values)
         return n
+
+    def describe(self, settings: Settings, pos_weight: float) -> dict:
+        """JSON-ready description for reports, read from the *built* estimator so it cannot
+        drift from the code (grid, imbalance handling and fixed hyper-parameters)."""
+        model = self.build(settings, pos_weight).named_steps["model"]
+        params = model.get_params()
+        fixed = {
+            k: params[k]
+            for k in FIXED_PARAM_KEYS
+            if k in params and params[k] is not None and params[k] != -1  # -1 = "no limit"
+        }
+        for k in self.grid:  # searched params are reported in the grid, not as fixed
+            fixed.pop(k.removeprefix("model__"), None)
+        return {
+            "name": self.name,
+            "display": self.display or self.name,
+            "family": self.family,
+            "estimator": type(model).__name__,
+            "preprocessing": self.preprocessing,
+            "imbalance": self.imbalance,
+            "grid": {k.removeprefix("model__"): v for k, v in self.grid.items()},
+            "n_candidates": self.n_candidates,
+            "fixed_params": fixed,
+        }
+
+
+FIXED_PARAM_KEYS = (
+    "n_estimators",
+    "max_depth",
+    "max_features",
+    "max_samples",
+    "class_weight",
+    "is_unbalance",
+    "scale_pos_weight",
+    "subsample",
+    "colsample_bytree",
+    "tree_method",
+    "max_iter",
+)
 
 
 def _prep() -> list[tuple[str, object]]:
@@ -108,24 +150,36 @@ MODEL_SPECS: dict[str, ModelSpec] = {
             "linear+woe",
             _logreg,
             {"model__C": [0.01, 0.1, 1.0, 10.0], "model__class_weight": [None, "balanced"]},
+            display="Logistic Regression",
+            preprocessing="clean → features → WoE/IV selection (IV ≥ 0.02, fitted per fold) → LR",
+            imbalance="class_weight ∈ {None, balanced} (searched)",
         ),
         ModelSpec(
             "random_forest",
             "bagged trees",
             _random_forest,
             {"model__max_depth": [8, 12], "model__min_samples_leaf": [10, 30]},
+            display="Random Forest",
+            preprocessing="clean → features → trees on raw, unbinned features",
+            imbalance="class_weight = balanced_subsample",
         ),
         ModelSpec(
             "lightgbm",
             "boosted trees",
             _lightgbm,
             {"model__num_leaves": [15, 31], "model__learning_rate": [0.05, 0.1]},
+            display="LightGBM",
+            preprocessing="clean → features → trees on raw, unbinned features",
+            imbalance="is_unbalance = True",
         ),
         ModelSpec(
             "xgboost",
             "boosted trees",
             _xgboost,
             {"model__max_depth": [3, 5], "model__learning_rate": [0.05, 0.1]},
+            display="XGBoost",
+            preprocessing="clean → features → trees on raw, unbinned features (hist)",
+            imbalance="scale_pos_weight = neg/pos",
         ),
     )
 }

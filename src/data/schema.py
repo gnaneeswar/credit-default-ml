@@ -213,7 +213,7 @@ EMPIRICAL_CHECK_NOTE = (
     "(artifacts/eda_summary.json -> domain_rule_checks). Two measured deviations: (1) a "
     "'paid in full' status in month k is confirmed by statement k being covered by the "
     "following month's payment (PAY_AMT_(k-1) >= BILL_AMT_k) in ~98-99% of rows, versus "
-    "~75-80% for the section-4 pairing (PAY_AMT_k >= BILL_AMT_(k+1)), i.e. the data aligns "
+    "~73-80% for the section-4 pairing (PAY_AMT_k >= BILL_AMT_(k+1)), i.e. the data aligns "
     "status codes one month later than the rule; (2) '-2 => BILL_AMT_n <= 0' holds for only "
     "~33-71% of -2 rows. Neither affects the engineered features, which use the status "
     "sequence and per-month amounts directly. Timing caveat: under the rule PAY_1 holds no "
