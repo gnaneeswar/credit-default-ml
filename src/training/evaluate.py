@@ -26,6 +26,7 @@ from src.common.config import Settings
 from src.common.logging import get_logger, log_path_io
 from src.common.mlflow_utils import load_champion
 from src.common.tables import log_table
+from src.training.threshold import banded_decile_table, population_stability_index
 
 log = get_logger(__name__)
 
@@ -117,6 +118,24 @@ def evaluate_champion(
         "at_registered_threshold": at_threshold,
         "at_default_0_5": at_default,
     }
+
+    # Holdout deciles on the *training* OOF score bands: rows line up with the train table,
+    # and the band shares measure score stability (PSI) on unseen data.
+    train_deciles_path = out / "train_decile_analysis.csv"
+    if train_deciles_path.exists():
+        log_path_io(log, "read", train_deciles_path)
+        train_deciles = pd.read_csv(train_deciles_path)
+        test_deciles = banded_decile_table(y, proba, train_deciles)
+        psi = population_stability_index(train_deciles["share"], test_deciles["share"])
+        metrics["score_psi_vs_train_bands"] = psi
+        log_table(log, "holdout deciles on the training score bands", test_deciles)
+        log.info("score PSI (holdout vs train bands) = %.4f (< 0.1 = stable)", psi)
+        path = out / "test_decile_analysis.csv"
+        test_deciles.to_csv(path, index=False, lineterminator="\n")
+        log_path_io(log, "write", path)
+    else:
+        log.warning("%s missing: skipping holdout decile table", train_deciles_path)
+
     files = {
         out / "test_metrics.json": json.dumps(metrics, indent=2) + "\n",
         out / "test_confusion_matrix.json": json.dumps(cm, indent=2) + "\n",

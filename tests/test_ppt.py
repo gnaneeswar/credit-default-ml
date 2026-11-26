@@ -125,7 +125,12 @@ def write_synthetic_artifacts(d: Path, holdout_f1: float = 0.6123) -> None:
         json.dumps({**metrics, "top_percent_flagged": TOP_PERCENT, "deciles_flagged": 3})
     )
     (d / "test_metrics.json").write_text(
-        json.dumps({"at_registered_threshold": {**metrics, "f1": holdout_f1, "roc_auc": 0.78}})
+        json.dumps(
+            {
+                "at_registered_threshold": {**metrics, "f1": holdout_f1, "roc_auc": 0.78},
+                "score_psi_vs_train_bands": 0.0123,
+            }
+        )
     )
     bad = np.sort(rng.random(10))[::-1] * 0.7
     pd.DataFrame(
@@ -139,6 +144,17 @@ def write_synthetic_artifacts(d: Path, holdout_f1: float = 0.6123) -> None:
             "f1": rng.random(10) * 0.5,
         }
     ).to_csv(d / "train_decile_analysis.csv", index=False)
+    pd.DataFrame(  # holdout on the train bands: uneven counts, one deliberately tiny band
+        {
+            "decile": range(1, 11),
+            "n": [612, 590, 601, 587, 610, 598, 605, 594, 600, 3],
+            "n_default": (bad * 600).astype(int),
+            "bad_rate": bad,
+            "lift": bad / 0.22,
+            "cum_capture": np.linspace(0.29, 1.0, 10),
+            "f1": rng.random(10) * 0.5,
+        }
+    ).to_csv(d / "test_decile_analysis.csv", index=False)
 
 
 @pytest.fixture(scope="module")
@@ -201,21 +217,33 @@ def test_minimum_font_sizes(deck) -> None:
                     assert all(run.font.size.pt >= floor for run in p.runs), shape.name
 
 
-def test_alternating_fills_and_operating_decile_highlight(deck) -> None:
-    deciles = next(s for s in deck.slides[4].shapes if s.name == "table:deciles").table
-    assert deciles.cell(0, 0).fill.fore_color.rgb == ppt.NAVY  # header
-    k = math.ceil(TOP_PERCENT / 10)  # operating decile
+@pytest.mark.parametrize("name", ["table:deciles_train", "table:deciles_test"])
+def test_alternating_fills_and_operating_decile_highlight(deck, name: str) -> None:
+    deciles = next(s for s in deck.slides[4].shapes if s.name == name).table
+    assert len(deciles.rows) == 11 and deciles.cell(0, 0).fill.fore_color.rgb == ppt.NAVY
+    k = math.ceil(TOP_PERCENT / 10)  # operating decile, highlighted in both tables
     for i in range(10):
         expected = ppt.TEAL if i == k - 1 else (ppt.WHITE if i % 2 == 0 else ppt.ROW_ALT)
         assert deciles.cell(i + 1, 0).fill.fore_color.rgb == expected, f"decile row {i + 1}"
 
 
+def test_results_slide_shows_train_and_holdout_deciles(deck) -> None:
+    shapes = {s.name: s for s in deck.slides[4].shapes}
+    assert {"table:metrics", "table:deciles_train", "table:deciles_test"} <= set(shapes)
+    train, test = shapes["table:deciles_train"], shapes["table:deciles_test"]
+    assert train.top == test.top and train.left < test.left  # side by side
+    assert test.table.cell(1, 1).text == "612" and test.table.cell(10, 1).text == "3"
+    assert "PSI 0.012" in shapes["label:deciles_test"].text_frame.text
+    assert "decile 3 = riskiest 26%" in shapes["label:deciles_train"].text_frame.text
+
+
 def test_numbers_come_from_artifacts(tmp_path) -> None:
     write_synthetic_artifacts(tmp_path, holdout_f1=0.6123)
     prs = Presentation(str(ppt.build_deck(ppt.load_inputs(tmp_path), tmp_path / "d.pptx")))
-    table = next(s for s in prs.slides[4].shapes if s.name == "table:oof_vs_test").table
-    f1_row = next(r for r in range(len(table.rows)) if table.cell(r, 0).text == "F1")
-    assert table.cell(f1_row, 2).text == "0.6123"
+    table = next(s for s in prs.slides[4].shapes if s.name == "table:metrics").table
+    f1_col = next(c for c in range(len(table.columns)) if table.cell(0, c).text == "F1")
+    holdout = next(r for r in range(len(table.rows)) if table.cell(r, 0).text.startswith("Hold"))
+    assert table.cell(holdout, f1_col).text == "0.6123"
     cover = " ".join(s.text_frame.text for s in prs.slides[0].shapes if s.has_text_frame)
     assert "0.612" in cover and "Random Forest" in cover
 
