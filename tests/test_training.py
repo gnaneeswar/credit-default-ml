@@ -7,7 +7,7 @@ import sys
 
 import numpy as np
 import pytest
-from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.dummy import DummyClassifier
 from sklearn.pipeline import Pipeline
 
@@ -50,19 +50,23 @@ def test_tune_model_reports_all_cv_metrics(small_xy) -> None:
     assert 0.3 < res.cv_metrics["mean_f1"] < 0.8
 
 
-def test_refit_with_oof_matches_cross_val_predict(small_xy) -> None:
+def test_fit_families_matches_cross_val_predict_and_is_single_threaded(small_xy) -> None:
     from sklearn.model_selection import cross_val_predict
 
-    from src.training.threshold import refit_with_oof
+    from src.training.threshold import fit_families
 
     X, y = small_xy
     cv = make_cv(Settings())
-    winner, oof, extra = refit_with_oof(lr_pipeline(), X, y, cv, {"lr": lr_pipeline()})
-    expected = cross_val_predict(lr_pipeline(), X, y, cv=cv, method="predict_proba")[:, 1]
-    np.testing.assert_allclose(oof, expected, rtol=1e-10)
-    full = lr_pipeline().fit(X, y)
-    np.testing.assert_allclose(winner.predict_proba(X), full.predict_proba(X), rtol=1e-10)
-    np.testing.assert_allclose(extra["lr"].predict_proba(X), full.predict_proba(X), rtol=1e-10)
+    rf = MODEL_SPECS["random_forest"].build(Settings(), 3.5).set_params(model__n_estimators=10)
+    fits = fit_families({"lr": lr_pipeline(), "rf": rf}, X, y, cv)
+    for name, template in (("lr", lr_pipeline()), ("rf", rf)):
+        expected = cross_val_predict(template, X, y, cv=cv, method="predict_proba")[:, 1]
+        np.testing.assert_allclose(fits[name].oof, expected, rtol=1e-10)
+        full = clone(template).fit(X, y)
+        np.testing.assert_allclose(
+            fits[name].model.predict_proba(X), full.predict_proba(X), rtol=1e-10
+        )
+    assert fits["rf"].model.named_steps["model"].n_jobs == 1  # C1: servable single-threaded
 
 
 # ---------------------------------------------------------------- deciles/cutoff
@@ -195,6 +199,51 @@ def test_feature_and_group_importance(small_xy) -> None:
         range(1, len(fi) + 1)
     )
     gi = group_importance(model, X, y.to_numpy(), n_repeats=2)
-    assert gi["auc_drop_mean"].is_monotonic_decreasing
-    assert len(gi) <= 5 + len(FEATURE_GROUPS)  # groups fully dropped by IV are skipped
-    assert gi.iloc[0]["auc_drop_mean"] > 0  # shuffling the strongest group hurts AUC
+    total, cond = gi[gi["kind"] == "total"], gi[gi["kind"] == "conditional"]
+    assert len(total) == 5 and set(total["origin"]) == {"original"}  # every raw source
+    assert set(cond["origin"]) == {"engineered"} and len(cond) <= len(FEATURE_GROUPS)
+    for part in (total, cond):
+        assert part["auc_drop_mean"].is_monotonic_decreasing
+        assert list(part["rank"]) == list(range(1, len(part) + 1))
+    # Shuffling the raw repayment history through the full pipeline hurts the most.
+    assert total.iloc[0]["group"] == "Repayment status" and total.iloc[0]["auc_drop_mean"] > 0
+
+
+def test_trusted_type_allowlist_is_shared_and_refuses_tampering() -> None:
+    from src.common import mlflow_utils
+    from src.training import registry
+
+    assert registry.is_trusted is mlflow_utils.is_trusted  # one rule for log and load time
+    assert "numpy." not in mlflow_utils.SERVING_TRUSTED_PREFIXES
+    mlflow_utils.check_trusted_types(["sklearn.tree._tree.Tree", "collections.OrderedDict"])
+    with pytest.raises(RuntimeError, match="untrusted"):
+        mlflow_utils.check_trusted_types(["sklearn.tree._tree.Tree", "builtins.eval"])
+    with pytest.raises(RuntimeError, match="untrusted"):
+        mlflow_utils.check_trusted_types(["collections.abc.Callable"])  # exact match only
+
+
+@pytest.mark.parametrize("family", list(MODEL_SPECS))
+def test_every_family_serialises_within_the_allowlist(small_xy, family: str) -> None:
+    """Each candidate family must be registrable: a family-specific persisted type (e.g.
+    LightGBM's OrderedDict) must not surface only on the day that family wins."""
+    X, y = small_xy
+    pipe = MODEL_SPECS[family].build(Settings(), 3.5)
+    if "model__n_estimators" in pipe.get_params():
+        pipe.set_params(model__n_estimators=5)
+    trusted_types(pipe.fit(X, y))  # raises if any persisted type is not allowlisted
+
+
+@pytest.mark.parametrize(
+    ("family", "label"),
+    [("lightgbm", "total gain"), ("xgboost", "total gain"), ("random_forest", "impurity (MDI)")],
+)
+def test_native_importance_is_comparable_across_families(small_xy, family, label) -> None:
+    """LightGBM's default importances are split COUNTS; the report must use gain instead."""
+    from src.training.evaluate import feature_importance
+
+    X, y = small_xy
+    pipe = MODEL_SPECS[family].build(Settings(), 3.5).set_params(model__n_estimators=20)
+    fi = feature_importance(pipe.fit(X, y))
+    assert fi["importance_type"].iloc[0] == label
+    assert fi["importance"].sum() == pytest.approx(1.0)
+    assert fi["importance"].between(0, 1).all()

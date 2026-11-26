@@ -208,11 +208,21 @@ ROLL = [
     [
         # never late: every trajectory signal off
         ((0, 0, 0, 0, 0, 0), {}),
-        # recently cured: 2 -> 2 -> 0 (two delinquent months, then current)
+        # recently cured: 2 -> 2 -> 0; the cure is the LATEST transition -> recent flag only
         (
             (0, 0, 0, 2, 2, 0),
             {
                 "CURED_RECENT": 1,
+                "N_ROLL_FWD": 1,
+                "MAX_ROLL_FWD_STEP": 2,
+                "N_STAGNANT": 1,
+                "MAX_DELINQ_STREAK": 2,
+            },
+        ),
+        # cured earlier in the history window -> counted in N_CURES, no recent flag
+        (
+            (0, 2, 2, 0, 0, 0),
+            {
                 "N_CURES": 1,
                 "N_ROLL_FWD": 1,
                 "MAX_ROLL_FWD_STEP": 2,
@@ -220,38 +230,36 @@ ROLL = [
                 "MAX_DELINQ_STREAK": 2,
             },
         ),
-        # roll forward 0 -> 2 in the latest month (step = 2 missed due dates)
+        # roll forward 0 -> 2 in the latest month: recent flag only, history counts stay 0
+        ((0, 0, 0, 0, 0, 2), {"ROLL_FWD_RECENT": 1, "MAX_DELINQ_STREAK": 1}),
+        # dormant straight to late in history: -2 -> 2 is a step of 2, not 4
         (
-            (0, 0, 0, 0, 0, 2),
-            {"ROLL_FWD_RECENT": 1, "N_ROLL_FWD": 1, "MAX_ROLL_FWD_STEP": 2, "MAX_DELINQ_STREAK": 1},
+            (-2, -2, -2, -2, 2, 2),
+            {"N_ROLL_FWD": 1, "MAX_ROLL_FWD_STEP": 2, "STAGNANT_RECENT": 1, "MAX_DELINQ_STREAK": 2},
         ),
-        # dormant straight to late: -2 -> 2 is a step of 2, not 4
-        (
-            (-2, -2, -2, -2, -2, 2),
-            {"ROLL_FWD_RECENT": 1, "N_ROLL_FWD": 1, "MAX_ROLL_FWD_STEP": 2, "MAX_DELINQ_STREAK": 1},
-        ),
-        # roll backward 3 -> 2 while still past due
+        # roll backward 3 -> 2 in the latest month (still past due)
         (
             (0, 0, 0, 0, 3, 2),
             {
                 "N_ROLL_FWD": 1,
                 "MAX_ROLL_FWD_STEP": 3,
                 "ROLL_BACK_RECENT": 1,
-                "N_ROLL_BACK": 1,
                 "MAX_DELINQ_STREAK": 2,
             },
         ),
-        # stagnation 2 -> 2 -> 2
+        # stagnation 2 -> 2 -> 2: one stagnant step in history + the recent flag
         (
             (0, 0, 0, 2, 2, 2),
             {
                 "N_ROLL_FWD": 1,
                 "MAX_ROLL_FWD_STEP": 2,
                 "STAGNANT_RECENT": 1,
-                "N_STAGNANT": 2,
+                "N_STAGNANT": 1,
                 "MAX_DELINQ_STREAK": 3,
             },
         ),
+        # 1 -> 0 is deliberately neither a cure (needs prev >= 2) nor a roll-back (needs cur > 0)
+        ((0, 0, 0, 0, 1, 0), {"N_ROLL_FWD": 1, "MAX_ROLL_FWD_STEP": 1}),
         # dormant -> revolver activation is NOT a roll forward
         ((-2, 0, 0, 0, 0, 0), {"N_DORMANT_TO_REVOLVER": 1}),
         # -2 -> -1 (dormant -> paid in full) is neither
@@ -259,11 +267,13 @@ ROLL = [
     ],
     ids=[
         "never-late",
-        "cured",
-        "roll-fwd",
+        "cured-recent",
+        "cured-history",
+        "roll-fwd-recent",
         "dormant-to-late",
         "roll-back",
         "stagnant",
+        "one-to-zero",
         "dormant-to-revolver",
         "dormant-to-paid",
     ],
@@ -278,7 +288,7 @@ def test_never_late_and_cured_differ() -> None:
     """The brief's motivating case: single-month snapshots can't tell these apart."""
     out = engineer(frame(status_row(0, 0, 0, 0, 0, 0), status_row(0, 0, 0, 2, 2, 0)))
     assert out.loc[0, "PAY_1"] == out.loc[1, "PAY_1"] == 0
-    assert out.loc[0, "N_CURES"] == 0 and out.loc[1, "N_CURES"] == 1
+    assert out.loc[0, "CURED_RECENT"] == 0 and out.loc[1, "CURED_RECENT"] == 1
 
 
 def test_feature_catalogues_cover_every_feature_exactly_once() -> None:
@@ -289,3 +299,22 @@ def test_feature_catalogues_cover_every_feature_exactly_once() -> None:
     eng = [f for _, feats, _ in FEATURE_GROUPS for f in feats]
     assert sorted(raw) == sorted(FEATURES) and len(raw) == len(set(raw))
     assert sorted(eng) == sorted(ENGINEERED) and len(eng) == len(set(eng))
+
+
+def test_latest_transition_is_never_counted_in_history() -> None:
+    # Every event happens only in the latest transition (PAY_2 -> PAY_1).
+    out = engineer(frame(status_row(0, 0, 0, 0, 3, 2), status_row(0, 0, 0, 0, 2, 0)))
+    for col in ("N_CURES", "N_ROLL_BACK", "N_STAGNANT", "N_DORMANT_TO_REVOLVER"):
+        assert (out[col] == 0).all(), col
+    assert out.loc[0, "ROLL_BACK_RECENT"] == 1 and out.loc[1, "CURED_RECENT"] == 1
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"PAY_1": np.nan}, {"BILL_AMT2": np.inf}, {"LIMIT_BAL": 1e-300}, {"BILL_AMT1": 1e39}],
+    ids=["nan-input", "inf-input", "tiny-limit", "beyond-float32"],
+)
+def test_non_finite_inputs_or_outputs_raise(overrides: dict) -> None:
+    """No silent imputation: callers bypassing the API get an explicit error (C2/M6)."""
+    with pytest.raises(ValueError, match="non-finite|float32"):
+        engineer(frame(make_row(**overrides)))

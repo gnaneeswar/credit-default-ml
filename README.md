@@ -9,7 +9,7 @@ the winner as `models:/credit-default-pipeline@champion` in a SQLite MLflow regi
 that it evaluates the champion on a 20% holdout, runs Evidently drift monitoring, and
 generates an 8-slide interview deck (`artifacts/credit_default_summary.pptx`).
 `Dockerfile.serve` loads that champion into **FastAPI**. On a 12-core laptop (WSL2) the
-pipeline takes **34–45 s** and the training container about 40–50 s end to end.
+pipeline takes about **37–44 s** on the host and the training container about 45–60 s end to end.
 
 ```bash
 git clone https://github.com/gnaneeswar/credit-default-ml.git && cd credit-default-ml
@@ -109,29 +109,37 @@ per-month amounts directly. They are documented rather than silently "fixed"; se
 
 ## 2. Results at a glance
 
-**Model selection** (3-fold stratified CV on the 24,000-row training split; best candidate per family):
+**Model selection** (3-fold stratified CV on the 24,000-row training split). Each family's
+hyperparameters come from `GridSearchCV(scoring="f1")`. The **champion is the family with
+the highest out-of-fold (OOF) F1 at its own tuned cutoff**, because that is the metric
+actually deployed:
 
-| Model | CV F1 | ± std | ROC-AUC | PR-AUC | Precision | Recall |
-|---|---|---|---|---|---|---|
-| **Random Forest** ✅ champion | **0.549** | 0.004 | 0.787 | 0.558 | 0.524 | 0.577 |
-| XGBoost | 0.545 | 0.008 | 0.789 | 0.561 | 0.468 | 0.653 |
-| LightGBM | 0.543 | 0.007 | 0.785 | 0.559 | 0.481 | 0.625 |
-| Logistic Regression (WoE/IV) | 0.535 | 0.009 | 0.780 | 0.540 | 0.465 | 0.631 |
+| Model | OOF F1 @ own cutoff | Cutoff | CV F1@0.5 (± std) | ROC-AUC | PR-AUC |
+|---|---|---|---|---|---|
+| **LightGBM** ✅ champion | **0.5475** | 0.520 | 0.544 ± 0.008 | 0.785 | 0.560 |
+| XGBoost | 0.5473 | 0.581 | 0.543 ± 0.006 | 0.789 | 0.563 |
+| Random Forest | 0.5472 | 0.530 | 0.546 ± 0.008 | 0.787 | 0.555 |
+| Logistic Regression (WoE/IV) | 0.5424 | 0.592 | 0.535 ± 0.010 | 0.780 | 0.539 |
 
-**Decision threshold:** 0.478, which means flagging the riskiest 26% of clients. It was
-picked from out-of-fold predictions; [§4.4](#44-model-selection-cv-and-threshold-tuning)
-explains how.
+The top three are **tied** within 0.0003 OOF F1, far less than the fold standard deviation
+(about 0.007). Ranked by F1@0.5 instead, the random forest would have won; §4.4 explains
+why that metric isn't comparable across families. The champion's settings are LightGBM with
+`num_leaves=31` and `learning_rate=0.05`.
+
+**Decision threshold:** 0.520, which means flagging the riskiest 27% of clients. The default
+0.5 was an explicit candidate. The tuned cutoff beats it on the OOF data (0.5475 vs 0.5442)
+and on the holdout below.
 
 **Holdout** (6,000 clients the model never saw, scored by the *registered* `@champion`):
 
 | Cutoff | F1 | Precision | Recall | Accuracy | ROC-AUC | PR-AUC | Flagged |
 |---|---|---|---|---|---|---|---|
-| registered 0.478 | 0.547 | 0.505 | 0.596 | 0.782 | 0.780 | 0.558 | 26.1% |
-| default 0.5 (reference) | 0.549 | 0.524 | 0.576 | 0.791 | 0.780 | 0.558 | 24.3% |
+| registered 0.520 | 0.543 | 0.484 | 0.617 | 0.770 | 0.778 | 0.561 | 28.2% |
+| default 0.5 (reference) | 0.539 | 0.470 | 0.632 | 0.761 | 0.778 | 0.561 | 29.8% |
 
-Confusion at 0.478: the model catches **791 of 1,327 defaults** and flags 775 good clients
-(TN 3,898 · FP 775 · FN 536 · TP 791). The train (OOF) F1 was 0.549 and holdout F1 is
-0.547, so the cutoff generalises.
+Confusion at 0.520: the model catches **819 of 1,327 defaults** and flags 873 good clients
+(TN 3,800 · FP 873 · FN 508 · TP 819). The OOF F1 was 0.548 and the holdout F1 is 0.543, so
+the cutoff generalises.
 
 **Lift:** the riskiest 10% of clients default at 3.2× the base rate. The top 30% contain
 64% of all defaults.
@@ -142,22 +150,21 @@ compares like for like with the training table:
 
 | Decile | Train bad rate | Holdout bad rate | Train cum. capture | Holdout cum. capture | Holdout share |
 |---|---|---|---|---|---|
-| 1 | 70.2% | 70.0% | 31.8% | 32.3% | 10.2% |
-| 3 (operating) | 27.6% | 25.5% | 63.9% | 63.6% | 10.0% |
-| 10 | 3.9% | 4.7% | 100% | 100% | 8.9% |
+| 1 | 69.8% | 68.8% | 31.6% | 33.2% | 10.7% |
+| 3 (operating) | 27.6% | 26.0% | 63.8% | 64.5% | 10.4% |
+| 10 | 5.1% | 5.8% | 100% | 100% | 7.8% |
 
-The rank-ordering holds on unseen data. Holdout band shares stay at 8.9–10.6% (the
-training bands hold 10% each by construction), giving a **score PSI of 0.003**, far below
-the usual 0.1 "stable" threshold. A PSI on these same bands is the natural production
-monitor for score drift.
+The rank-ordering holds on unseen data. The holdout band shares stay within 7.8–11.3% (each
+training band holds 10% by construction), giving a **score PSI of 0.009**, far below the
+usual 0.1 "stable" threshold. Monitoring reuses this score-band PSI for prediction drift.
 
 **Monitoring** (Evidently, compared against the out-of-fold training baseline):
 
-| Batch | Drifted features | F1 (Δ) | Alerts |
-|---|---|---|---|
-| holdout | 0 / 23 | 0.547 (−0.002) | none |
-| simulated downturn (limits −40%, statuses `PAY_1..6` +1 month, bills +40%) | 13 / 23 | 0.450 (−0.098) | data drift + performance |
-| concept drift (30% of labels flipped) | 0 / 23 | 0.397 (−0.152) | performance only |
+| Batch | Drifted features | Score PSI | F1 (Δ) | Alerts |
+|---|---|---|---|---|
+| holdout | 0 / 23 | 0.009 | 0.543 (−0.005) | none |
+| simulated downturn (limits −40%, revolving / late statuses +1 month, bills +40%) | 13 / 23 | 0.751 | 0.451 (−0.096) | data drift + score drift + performance |
+| concept drift (30% of labels flipped) | 0 / 23 | 0.009 | 0.412 (−0.136) | performance only |
 
 ## 3. Architecture
 
@@ -197,13 +204,15 @@ The training run prints a stage-timing table at the end.
 ### 4.1 Undocumented category codes and domain rules
 
 The EDA ([artifacts/eda_report.md](artifacts/eda_report.md), generated) checks every code
-that appears in the data but not in the UCI documentation:
+that appears in the data but not in the UCI documentation. **Default rates come from the
+24,000-row training split only**, so the holdout's labels never informed a design
+decision. Row counts are over the full data.
 
 | Column | Codes | Rows | Evidence | Decision |
 |---|---|---|---|---|
-| `EDUCATION` | 0, 5, 6 | 345 (1.2%) | default rates 0–16%, close to code 4 "others" (5.7%), far from codes 1–3 (19–25%) | **remap to 4**: supported by the data |
-| `MARRIAGE` | 0 | 54 (0.2%) | default rate 9.3% vs 26% for code 3 | **remap to 3** on meaning (unknown ≈ "others"). The rates do *not* match; 54 rows are too few for a reliable level of their own |
-| `PAY_n` | −2, 0 | most common codes | `0` revolving (12.8%) and `−2` no consumption (13.2%) default **less** than `−1` paid in full (16.8%) | **keep as distinct codes**: collapsing them into −1 would lose real signal |
+| `EDUCATION` | 0, 5, 6 | 345 (1.2%) | train default rates 0–17%, close to code 4 "others" (6.2%), far from codes 1–3 (19–25%) | **remap to 4**: supported by the data |
+| `MARRIAGE` | 0 | 54 (0.2%) | train default rate 10.6% vs 28.2% for code 3 | **remap to 3** on meaning (unknown ≈ "others"). The rates do *not* match; 54 rows are too few for a reliable level of their own |
+| `PAY_n` | −2, 0 | most common codes | `0` revolving (12.8%) and `−2` inactive (12.7%) default **less** than `−1` paid in full (16.6%) | **keep as distinct codes**: collapsing them into −1 would lose real signal |
 
 **`PAY_n` codes are fed to the models as ordinal numbers** (−2 < −1 < 0 < 1 …), not one-hot
 encoded. Their risk is **not monotone** at the low end (−1 is riskier than 0 and −2), so
@@ -256,79 +265,96 @@ near-duplicate columns.
 | Intra-cycle paydown (liquidity) | `PAYDOWN_1`, `N_PAYDOWN`, `MAX_PAYDOWN_EXCESS` | `PAY_AMT_n > BILL_AMT_n`; excess = `max(PAY − BILL, 0) / LIMIT` | 15.7% |
 | Implied spend | `SPEND_1`, `SPEND_MEAN_3`, `SPEND_MEAN_5` | `BILL_AMT_n − (BILL_AMT_(n+1) − PAY_AMT_n)`, divided by `LIMIT`; 3- and 5-month rolling means smooth calendar-month vs. statement-cutoff timing | — |
 
-**Roll-rate trajectory (11).** These cover the 5 transitions `PAY_6 → … → PAY_1`.
-`*_RECENT` means the latest transition, `PAY_2 → PAY_1`. Single-month snapshots treat a
-never-late account (`0,0,0`) like a recently cured one (`2,2,0`). These features separate
-them.
+**Roll-rate trajectory (11).** These use the status sequence `PAY_6 → … → PAY_1`.
+Single-month snapshots treat a never-late account (`0,0,0`) like a recently cured one
+(`2,2,0`); these features separate them.
+- **`*_RECENT` flags** cover the **latest** transition (`PAY_2 → PAY_1`).
+- **The `N_*` counts and `MAX_ROLL_FWD_STEP`** cover only the **4 history transitions**
+  (`PAY_6 → … → PAY_2`).
 
-| Signal | Features | Logic | Default rate (any) |
+The split is deliberate. Code `1` exists almost only in `PAY_1`, so the latest transition is
+coded differently. In the full data it has 1,922 roll-backs against 74–161 in each earlier
+transition. Keeping it out of the counts means each feature sees one coding regime, and no
+event is counted twice.
+
+| Signal | Features | Logic | Train default rate (any) |
 |---|---|---|---|
-| Cure | `CURED_RECENT`, `N_CURES` | prev ≥ 2 and cur ≤ 0 | 26.9% (cured, now current) vs **11.7%** never late |
-| Roll forward (worsening) | `ROLL_FWD_RECENT`, `N_ROLL_FWD`, `MAX_ROLL_FWD_STEP` | cur > prev **and cur ≥ 1**; step = cur − max(prev, 0) | 42.0% |
-| Dormant → revolver | `N_DORMANT_TO_REVOLVER` | prev = −2 and cur = 0 | 18.2% |
-| Roll backward (improving, still late) | `ROLL_BACK_RECENT`, `N_ROLL_BACK` | cur < prev, both > 0 | 47.3% |
-| Stagnation (chronic delay) | `STAGNANT_RECENT`, `N_STAGNANT`, `MAX_DELINQ_STREAK` | cur = prev ≥ 2; longest run of `PAY ≥ 2` | 57.0% |
+| Cure | `CURED_RECENT`, `N_CURES` | prev ≥ 2 and cur ≤ 0 | 27.2% (cured, now current) vs **11.5%** never late |
+| Roll forward (worsening) | `ROLL_FWD_RECENT`, `N_ROLL_FWD`, `MAX_ROLL_FWD_STEP` | cur > prev **and cur ≥ 1**; step = cur − max(prev, 0) | 42.1% |
+| Dormant → revolver | `N_DORMANT_TO_REVOLVER` | prev = −2 and cur = 0 | 18.7% |
+| Roll backward (improving, still late) | `ROLL_BACK_RECENT`, `N_ROLL_BACK` | cur < prev, both > 0 | 47.7% |
+| Stagnation (chronic delay) | `STAGNANT_RECENT`, `N_STAGNANT`, `MAX_DELINQ_STREAK` | cur = prev ≥ 2; longest run of `PAY ≥ 2` | 57.3% |
 
-**Two deliberate deviations from the literal roll-forward rule** (`PAY_n > PAY_(n+1)`):
+**Deliberate choices relative to the literal rules:**
 1. **Roll-forward requires `cur ≥ 1`.** Moves among the non-delinquent codes are not
-   "worsening into delinquency". `−2 → 0` (dormant → revolver) is its own signal instead.
-   Its 18.2% default rate sits between never-late-and-never-dormant (11.1%) and roll-forward
-   (42.0%), so it would have diluted both.
+   "worsening into delinquency". `−2 → 0` (dormant → revolver) is its own signal instead:
+   its 18.7% default rate sits between never-late (11.5%) and roll-forward (42.1%), so
+   merging it into either would dilute both.
 2. **The step is measured from `max(prev, 0)`.** So `−2 → 2` counts as 2 missed due dates,
    not 4.
+3. **A cure requires `prev ≥ 2`.** Recovering from a single missed due date (`1 → 0`) counts
+   as neither a cure nor a roll-back, since roll-back needs `cur > 0`.
 
 There is no recent flag for dormant → revolver, because `PAY_2 = −2 → PAY_1 = 0` occurs in
-**0** of 30,000 rows. The latest transition also behaves differently from earlier ones: it
-has 1,922 roll-backs against 74–161 elsewhere, because code `1` effectively exists only in
-`PAY_1`. The `*_RECENT` flags isolate it.
+**0** of 30,000 rows.
 
 **What IV says.**
 - **Raw bills vs engineered ratios.** Raw `BILL_AMT1–5` have IV 0.013–0.016 and are dropped.
   `UTIL_*` reach 0.08–0.12, and `PAY_COVER_1` (0.24) beats raw `PAY_AMT1` (0.18).
-- **The new trajectory features are among the strongest.** Five of the top 12: 
-  `MAX_DELINQ_STREAK` 0.85, `N_STAGNANT` 0.57, `N_ROLL_FWD` 0.48, `MAX_ROLL_FWD_STEP` 0.48,
-  `STAGNANT_RECENT` 0.38.
+- **The trajectory features rank high.** `MAX_DELINQ_STREAK` 0.85, `N_STAGNANT` 0.48,
+  `STAGNANT_RECENT` 0.38, `N_ROLL_FWD` and `MAX_ROLL_FWD_STEP` 0.30.
 - **Sparse flags fall below 0.02 for LR.** `OVER_LIMIT_1`, `N_CREDIT_BAL`, `CURED_RECENT`,
   `N_DORMANT_TO_REVOLVER`, `HAS_CREDIT_BAL_1` and `MIN_CREDIT_BAL_RATIO` are dropped there.
   The tree models still use them.
 
 **What the champion relies on** (`artifacts/feature_group_importance.csv`). This is
-**group** permutation importance on the 6,000-row holdout: every column of a group is
-shuffled together, so correlated siblings can't stand in for each other.
+permutation importance on the 6,000-row holdout, as the drop in ROC-AUC. It answers two
+different questions:
 
-| Rank | Group | Origin | ΔROC-AUC when shuffled |
+| Total importance: raw source shuffled **before** the pipeline | ΔAUC | | Conditional: engineered group shuffled **after** the pipeline | ΔAUC |
+|---|---|---|---|---|
+| Repayment status (`PAY_1..6`) | **0.160** | | Status counts | 0.058 |
+| Payments (`PAY_AMT*`) | 0.044 | | Utilisation | 0.014 |
+| Bill amounts (`BILL_AMT*`) | 0.029 | | Implied spend | 0.003 |
+| Credit limit | 0.016 | | Payment coverage | 0.003 |
+| Demographics | 0.006 | | Stagnation | 0.001 |
+
+- **Total** shuffles the raw columns, so every derived feature changes with them. Shuffling
+  `PAY_1..6` also scrambles `N_DELINQ`, the roll-rate features and `MAX_DELINQ_STREAK`. This
+  measures how much the model relies on that source of information.
+- **Conditional** shuffles one engineered group while the raw columns it came from stay
+  intact. It measures what the group adds *on top of everything else*, so it is a lower
+  bound. Several sparse groups (cure, over-limit, credit balance) add nothing at the margin.
+
+An earlier version measured only the conditional kind and reported repayment status at
+0.016. The total view shows the model's dependence on repayment history is roughly ten
+times larger.
+
+Per feature, the champion's own importance (**total gain**) ranks `N_DELINQ`, `MAX_DELINQ`
+and `PAY_1` first, then payments and utilisation. Gain is computed on training data and
+favours continuous features, so it is reported *alongside* the holdout group view. LightGBM's
+default `feature_importances_` are split **counts**, not gain, so the code reads total gain
+explicitly for both boosters.
+
+**History of the feature work** (same splits, grids and seeds):
+
+| | `main` @ `bfc33f6` (45 features) | + billing features (68) | + review fixes (now) |
 |---|---|---|---|
-| 1 | Repayment status (`PAY_1..6`) | original | 0.016 |
-| 2 | Utilisation (`UTIL_*`) | engineered | 0.015 |
-| 3 | Bill amounts | original | 0.010 |
-| 4 | Payments | original | 0.009 |
-| 5 | Status counts | engineered | 0.009 |
-| 6 | Stagnation | engineered | 0.007 |
-| 7 | Roll forward | engineered | 0.004 |
+| Champion (selection rule) | RF (CV F1@0.5) | RF (CV F1@0.5) | **LightGBM (OOF F1 @ own cutoff)** |
+| Champion CV F1@0.5 | 0.5460 | 0.5493 | 0.5442 |
+| Holdout F1 @ registered cutoff | 0.5379 | 0.5468 | 0.5426 |
+| Holdout precision / recall | 0.485 / 0.604 | 0.505 / 0.596 | 0.484 / 0.617 |
+| Holdout ROC-AUC / PR-AUC | 0.777 / 0.553 | 0.780 / 0.558 | 0.778 / **0.561** |
 
-Single-feature permutation scores are tiny here (≤ 0.009), because 68 correlated inputs
-cover for each other. That is why groups are the honest unit of attribution. Per feature,
-the champion's own impurity importance (MDI) ranks `PAY_1` first, then `N_DELINQ`,
-`MAX_DELINQ`, and four new roll-rate features in the top 7 (`MAX_DELINQ_STREAK`,
-`N_STAGNANT`, `N_ROLL_FWD`, `MAX_ROLL_FWD_STEP`). MDI is computed on training data and
-favours continuous, correlated features, so it is reported *alongside* the holdout group
-view, not instead of it. Per-feature permutation on all 68 inputs was measured at 7–9 s,
-too slow for the 45 s budget.
+The billing features gave a consistent, modest gain. The review fixes changed the
+methodology:
+- family selection by the deployed metric;
+- 0.5 as an explicit threshold candidate;
+- history-only roll counts.
 
-**Impact vs. the 45-feature baseline** (same splits, grids and seeds; `main` @ `bfc33f6`):
-
-| | Baseline (45 features) | Billing-cycle features (68) | Δ |
-|---|---|---|---|
-| RF CV F1 (champion) | 0.5460 ± 0.0065 | **0.5493 ± 0.0042** | +0.003 |
-| XGBoost / LightGBM / LR CV F1 | 0.5420 / 0.5438 / 0.5346 | 0.5447 / 0.5434 / 0.5354 | +0.003 / −0.000 / +0.001 |
-| Holdout F1 @ registered cutoff | 0.5379 | **0.5468** | +0.009 |
-| Holdout precision / recall | 0.485 / 0.604 | 0.505 / 0.596 | +0.021 / −0.008 |
-| Holdout ROC-AUC / PR-AUC | 0.777 / 0.553 | 0.780 / 0.558 | +0.003 / +0.005 |
-| Pipeline runtime | 41–45 s | 34–41 s | unchanged (noise) |
-
-The gain is **consistent but modest**. Three of four families improve in CV, and the
-holdout improves on every ranking metric. On its own, +0.009 F1 is still within the
-holdout's sampling error (about ±0.015).
+Those changes trade 0.004 holdout F1 for higher recall and PR-AUC. Every change between
+columns is within the holdout's sampling error (about ±0.015). The methodology change was
+made because it is correct, not because it scores higher.
 
 ### 4.3 Leak-free WoE/IV for Logistic Regression; raw features for trees
 
@@ -361,79 +387,113 @@ holdout's sampling error (about ±0.015).
   of the training data. The same fold object is shared by all models and the threshold
   step. The 20% test set is touched **once**, by the registered champion.
 * **Compact grids** (8/4/4/4 candidates) with bounded depths, 100–200 trees and
-  `tree_method="hist"`. Parallelism is one process per CV fit (`GridSearchCV(n_jobs=-1)`).
-  Each estimator runs single-threaded (`n_jobs=1`, `OMP_NUM_THREADS=1`), which avoids
-  nested OpenMP contention in WSL2 and Docker.
-* **Imbalance and `scoring="f1"`.** F1 in the search is computed at the default 0.5
-  cutoff, so each model is weighted towards the minority class (`class_weight`,
-  `is_unbalance`, `scale_pos_weight`). This shifts its probabilities so that 0.5 is a
-  sensible cutoff, which makes F1 a fair way to compare candidates. The LR grid shows the
-  effect directly. Weighted and unweighted LR rank clients equally well (**ROC-AUC 0.780
-  for both**). Without weights, F1 at 0.5 collapses to **0.47** (recall 0.36) instead of
-  **0.535**. The trade-off is that weighted models are not calibrated probabilities. That
-  is acceptable here because decisions use a tuned cutoff, not the raw scores.
-* **Winner:** RF (`max_depth=12, min_samples_leaf=10`), by CV F1 (0.549). The top three are
-  within 0.006 F1 of each other (about 1.4× the champion's fold std), so they are close to
-  tied, and RF wins on the stated criterion. XGBoost has the best ROC-AUC and PR-AUC.
-* **Threshold: coarse-to-fine, decile-based.**
+  `tree_method="hist"`. Parallelism is one process per fit (`n_jobs=-1` at the search and
+  refit level). Each estimator runs single-threaded (`n_jobs=1`, `OMP_NUM_THREADS=1`), which
+  avoids nested OpenMP contention. The **served** model is single-threaded too: the registry
+  enforces it, and a test checks it on a real tree model.
+* **Imbalance and `scoring="f1"`.** Inside each family, `GridSearchCV` ranks candidates by
+  F1 at 0.5. Each model is weighted towards the minority class (`class_weight`,
+  `is_unbalance`, `scale_pos_weight`), which shifts its probabilities so that 0.5 is a
+  sensible cutoff *for that model*. The LR grid shows the effect directly: weighted and
+  unweighted LR rank clients equally well (**ROC-AUC 0.780 for both**), but without weights
+  F1 at 0.5 collapses to **0.46** (recall 0.35) instead of **0.535**. The trade-off is that
+  weighted models are not calibrated probabilities. That is acceptable because decisions use
+  a tuned cutoff.
+* **Choosing between families: OOF F1 at each family's own cutoff.** The four families
+  handle imbalance in different ways, so 0.5 sits at a different point on each one's
+  precision/recall curve, and F1@0.5 is not comparable *across* families. Instead:
+  1. One parallel batch fits each family's 3 OOF folds plus its full refit (`fit_families`).
+  2. Each family gets its own threshold from its own OOF scores.
+  3. The family with the highest OOF F1 at that cutoff wins.
+
+  LightGBM, XGBoost and the random forest are tied within 0.0003. **Caveat:** the same 3
+  folds pick the hyperparameters, the cutoff and the family, so OOF F1 is mildly optimistic
+  (a winner's curse). The untouched holdout is the unbiased estimate.
+* **Threshold: coarse-to-fine, with 0.5 as a candidate.**
   1. The OOF decile table ([artifacts/train_decile_analysis.csv](artifacts/train_decile_analysis.csv))
      shows bad rate, lift, cumulative capture, and the F1 you would get from flagging the
      top *k* deciles. The best is *k* = 3.
-  2. Percentile cutoffs (1% steps) are then searched only inside deciles 2–4. Result:
-     **flag the riskiest 26%, cutoff 0.478** (OOF F1 0.549).
+  2. Percentile cutoffs (1% steps) are searched across "flag the top 20–40%", the window
+     around that decile. The default 0.5 is added as an explicit candidate, and ties go to
+     0.5, so tuning is used only when it actually helps.
 
-  Every cutoff therefore reads as a credit policy ("review the riskiest 26%"). Deciles
-  alone move 10% of clients at a time, too coarse to find the best F1. An unconstrained
-  search could chase noise.
-* **Honest caveat:** the F1 curve is **flat** between about 0.47 and 0.52. On the OOF data,
-  the default 0.5 gives F1 0.5493 against 0.5488 for the chosen cutoff. On the holdout, 0.5
-  scores 0.549 against 0.547 for the registered cutoff, and the order flipped between
-  development runs. Differences of ±0.003 sit well inside the CV standard deviation (0.007)
-  and the holdout's sampling error (about ±0.015 with 1,327 defaults). I did **not** retune
-  on the test set, which would leak it into the model. On a flat plateau the cutoff mostly
-  chooses a precision/recall mix. In production it should come from a cost matrix (loss
-  per missed default vs. cost per false alarm), and this pipeline makes it a single
-  registered, auditable number.
+  Result: **flag the riskiest 27%, cutoff 0.520**. That gives OOF F1 0.5475 against 0.5442
+  at 0.5, and holdout F1 0.543 against 0.539.
+* **Honest caveat:** the F1 curve is fairly flat around its peak (0.47–0.53). Differences of
+  a few thousandths sit inside the CV standard deviation (about 0.007) and the holdout's
+  sampling error (about ±0.015 with 1,327 defaults). I did **not** retune on the test set,
+  which would leak it into the model. In production the cutoff should come from a cost
+  matrix (loss per missed default vs. cost per false alarm). The pipeline makes it a single
+  registered, auditable number, stored at full precision as a model-version tag.
+* **`scale_pos_weight`** for XGBoost is computed once from the full training labels and
+  reused inside the CV folds. Strictly, that crosses fold boundaries. Under stratification
+  the fold ratios match the full ratio to the third decimal, so the effect is negligible.
 
 ### 4.5 Decoupled architecture: FastAPI + MLflow Registry + Evidently
 
 * **MLflow is used as a library only.** It provides tracking, artifacts and the model
   registry in `sqlite:///mlruns/mlflow.db` with artifacts in `./mlruns`. A parent run logs
   the pipeline, with one nested run per model family. The winner is registered as
-  `credit-default-pipeline`, with alias `@champion` and version tags (`optimal_threshold`,
-  `cv_f1`, `best_params` …). No `mlflow models serve` or `build-docker` is used.
+  `credit-default-pipeline`, with alias `@champion` and version tags (`optimal_threshold` at
+  full precision, `cv_f1`, `best_params` …). No `mlflow models serve` or `build-docker` is
+  used.
 * **Portable paths.** Both containers use `WORKDIR /app` and the same relative URIs, so the
   `file:///app/mlruns/...` locations written by the training container resolve unchanged in
   the serving container. If a database from another working directory is mounted (e.g.
   trained on the host), the pipeline **fails fast with a clear message** instead of loading
-  broken paths.
+  broken paths. The serving container mounts `./mlruns` **read-only**.
+* **Version-pinned loading.** The loader resolves `@champion` **once**, then reads the
+  threshold, signature and model from `models:/credit-default-pipeline/<version>`. A retrain
+  that moves the alias mid-load therefore can't pair one version's model with another
+  version's threshold.
 * **Safe serialisation.** MLflow 3's sklearn flavour stores the pipeline with **skops**,
   not pickle. Only explicitly trusted types can load, so loading a model cannot run
-  arbitrary code. The trusted list comes from the fitted pipeline and is checked against an
-  allowlist (`src.features.`, `sklearn.`, `xgboost.`, `lightgbm.`). An unexpected type
-  aborts registration.
+  arbitrary code.
+  - **One shared allowlist.** It lives in `src.common.mlflow_utils.is_trusted`: the prefixes
+    `src.features.`, `sklearn.`, `xgboost.`, `lightgbm.`, plus the exact type
+    `collections.OrderedDict`, a plain container that LightGBM persists.
+  - **Checked twice.** The registry checks at logging time, and the serving loader checks the
+    list stored with the model *again* at load time. A tampered `MLmodel` can't widen what
+    the API agrees to deserialise.
+  - **Every family is tested.** A test serialises each candidate family, so a
+    family-specific type can't surface only on the day that family wins.
 * **One loader for evaluation, serving and monitoring.** All three call
-  `src.common.mlflow_utils.load_champion`. So the holdout evaluation tests the exact code
-  path the API uses: the batch client's F1 over HTTP matches the holdout evaluation
+  `src.common.mlflow_utils.load_champion`. The holdout evaluation therefore tests the exact
+  code path the API uses: the batch client's F1 over HTTP matches the holdout evaluation
   exactly.
-* **FastAPI service** (`src/inference`) has no imports from training or data code; AST and
-  runtime tests enforce this.
+* **FastAPI service** (`src/inference`) has no imports from training, data, monitoring or
+  reporting code. AST tests (which resolve relative imports) and a runtime test enforce
+  this.
   - **Request contract:** `dataframe_split` with exactly the 23 signature columns, in any
     order. The app reorders them to the training order and converts them to float64.
-  - **Validation:** values must be finite numbers. Strings, booleans, null and NaN return
-    422, and a 422 names the missing or unknown columns. Error responses never echo the
-    request back, so a bad 6,000-row batch isn't returned in full and a NaN can't crash
-    the error encoder.
-  - **Failed model load:** the process stays up and `/health` returns 503 with the reason.
+  - **Business ranges:** every column has a rule (`FEATURE_RULES`), and anything outside it
+    returns **422** with up to 20 `{row, column, value, rule}` violations. No value is
+    silently clipped, imputed or scored. The rules:
+    - `LIMIT_BAL` between 1 and 1e9;
+    - `SEX` ∈ {1, 2}, `EDUCATION` 0–6, `MARRIAGE` 0–3, `AGE` 18–100, `PAY_n` −2..9 (all
+      integer codes);
+    - `|BILL_AMT| ≤ 1e9`, `0 ≤ PAY_AMT ≤ 1e9`.
+  - **Hard failures are 422, never 500.** These are rejected before scoring: strings,
+    booleans, null, NaN/Infinity, magnitudes above 1e15 (checked *before* float conversion,
+    so `10**400` can't overflow) and values beyond float32 range. The transformer also
+    raises on non-finite input, rather than filling it silently, for callers that bypass
+    the API.
+  - **Error responses never echo the request,** so a bad 6,000-row batch isn't returned in
+    full and a NaN can't crash the error encoder.
+  - **Failed model load:** the process stays up and `/health` returns 503 with the
+    exception class only. Paths and URIs stay in the server log.
 * **Evidently monitoring** compares each batch against the **OOF** training predictions, an
-  honest baseline that isn't inflated by in-sample fit. It runs `DataDriftPreset` and
-  `ClassificationPreset` at the registered threshold. Alerts fire when ≥ 25% of features
-  drift, or when F1 or accuracy drops > 0.05.
-  - The downturn simulation is caught by drift detection: exactly the 13 shifted columns
-    (`LIMIT_BAL`, `PAY_1..PAY_6`, `BILL_AMT1..6`) are flagged, and the untouched `PAY_AMT*`
-    are not.
-  - Concept drift shows **no feature drift at all**, but F1 drops 0.15. Drift detection
-    alone would miss it, which is why label-based performance monitoring is needed as well.
+  honest baseline that isn't inflated by in-sample fit (it is mildly optimistic for the same
+  winner's-curse reason as in §4.4). It runs `DataDriftPreset` and `ClassificationPreset` at
+  the registered threshold, plus a **score PSI** on the training decile bands, which catches
+  output drift caused by engineered features that raw-column tests can't see. Alerts fire
+  when ≥ 25% of features drift, when score PSI > 0.25, or when F1 or accuracy drops > 0.05.
+  - **The downturn simulation** worsens only revolving and late statuses (`PAY ≥ 0`); an
+    inactive or paid-in-full status isn't "worse" by one step. It is caught by feature
+    drift (exactly the 13 shifted columns), by score drift (PSI 0.75) and by performance.
+  - **Concept drift** shows **no feature or score drift at all**, but F1 drops 0.14. Drift
+    detection alone would miss it, which is why label-based performance monitoring is
+    needed as well.
 
 ### 4.6 Engineering choices worth knowing
 
@@ -444,7 +504,8 @@ holdout's sampling error (about ±0.015).
 | float64 model signature | robust to clients sending `20000.0`; avoids MLflow's integer-schema pitfalls |
 | offline-first data | the CSV and dictionary are committed; `ucimlrepo` runs only on a cache miss or `--refresh` |
 | `pathlib` only, LF only | enforced by ruff `PTH` rules and `.gitattributes` / `.editorconfig` |
-| pipeline 34–45 s (was 55–60 s) | MLflow start-up overlaps the searches in a background thread; `refit=False` searches plus one parallel batch for the winner's refit and OOF folds; Evidently workers pre-warmed while registration runs. Results are bit-identical to the naive version. Container start-up and exit add about 5 s |
+| pipeline about 37–44 s on the host | MLflow start-up overlaps the searches in a background thread; `refit=False` searches plus one parallel batch with every family's OOF folds and full refit; Evidently workers pre-warmed while registration runs. Container start-up and exit add about 5 s, and the training container takes about 45–60 s depending on host load |
+| single-threaded serving | every estimator keeps `n_jobs=1`, and the registry enforces it before logging. A multi-threaded forest takes about 4× longer per row and spawns a thread pool per request inside uvicorn |
 | `PAY_0` → `PAY_1` | consistent 1–6 indexing across all three monthly families; the UCI name is recorded in `schema.UCI_ORIGINAL_NAMES` and the dictionary |
 | deck from artifacts only | every slide number is read from `artifacts/*.json` / `*.csv`; the build checks text fit and raises `LayoutError` instead of overflowing |
 | non-root containers | `USER 1000:1000`; `HOME`, `USER` and `LOGNAME` are set so MLflow works for any `-u` UID |
@@ -475,7 +536,10 @@ docker compose up --build
 `train` runs all stages and exits 0. `serve` starts only after that
 (`service_completed_successfully`) and listens on `http://localhost:8000`. It shows
 `(healthy)` in `docker compose ps` once the model is loaded, a few seconds after start.
-If your UID is not 1000, use `UID=$(id -u) GID=$(id -g) docker compose up --build`.
+If your UID is not 1000, use `HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose up --build`.
+(`UID=...` does not work, because bash's `UID` is read-only and never exported.) Clone the
+repo inside the Linux filesystem (e.g. `~/projects`), **not** under `/mnt/c` on WSL2, where
+SQLite locking and UID mapping on bind mounts break.
 
 Batch-score the holdout against the running service (in a second terminal):
 
@@ -516,13 +580,18 @@ to load it.
 ```bash
 curl -s localhost:8000/health
 # {"status":"ok","model_loaded":true,"model_name":"credit-default-pipeline","model_alias":"champion",
-#  "model_version":"1","model_family":"bagged trees","threshold":0.478358,"n_features":23,"error":null}
+#  "model_version":"1","model_family":"boosted trees","threshold":0.5197054344940619,
+#  "n_features":23,"error":null}
 
 curl -s -X POST localhost:8000/invocations \
      -H 'Content-Type: application/json' -d @sample_request.json
-# {"predictions":[{"default_probability":0.94,"prediction":1},
-#                 {"default_probability":0.32,"prediction":0},
-#                 {"default_probability":0.09,"prediction":0}], "threshold":0.478358, ...}
+# {"predictions":[{"default_probability":0.95,"prediction":1},
+#                 {"default_probability":0.36,"prediction":0},
+#                 {"default_probability":0.07,"prediction":0}], "threshold":0.5197..., ...}
+
+# Out-of-contract values are rejected (422), never silently scored:
+#   LIMIT_BAL=-5000 -> {"detail":{"error":"values outside the allowed ranges","n_violations":1,
+#     "violations":[{"row":0,"column":"LIMIT_BAL","value":-5000.0,"rule":"credit limit: 1 .. 1e9"}]}}
 ```
 
 [`sample_request.json`](sample_request.json) holds three real holdout clients: a delinquent
@@ -572,7 +641,7 @@ curl -s -X POST localhost:8000/invocations -H 'Content-Type: application/json' \
 | `artifacts/test_metrics.json`, `test_confusion_matrix.{json,png}` | holdout evaluation of `@champion` |
 | `artifacts/monitoring_report*.html`, `monitoring_summary.json` | Evidently reports and alert summary |
 | `artifacts/credit_default_summary.pptx` | **interview deck** (16:9, cover + 7 slides: EDA observations, data preprocessing and missing-value treatment, feature catalogue, feature selection and champion importance, candidate models and CV grids, top 3 models, Train OOF vs Holdout metrics with both decile tables), rebuilt from the artifacts on every run; `uv run python -m src.reporting.ppt` rebuilds it alone |
-| `artifacts/feature_importance.csv`, `feature_group_importance.csv` | champion importance: per feature from the model (impurity MDI for trees, \|coef\| for LR) and per feature group as holdout permutation ΔROC-AUC |
+| `artifacts/feature_importance.csv`, `feature_group_importance.csv` | champion importance: per feature from the model (total gain for LightGBM / XGBoost, impurity MDI for random forest, \|coef\| for LR, normalised), and per feature group as holdout permutation ΔROC-AUC, either **total** (raw source through the pipeline) or **conditional** (engineered group) |
 | `artifacts/model_grids.json`, `train_oof_metrics.json` | deck inputs: model grids, imbalance handling and CV setup (generated from the model specs), and OOF metrics at the threshold |
 | `artifacts/batch_predictions.csv` | batch client output: actual vs predicted |
 | `mlruns/` | MLflow tracking database, model registry and artifacts |
@@ -583,7 +652,7 @@ To browse the runs (optional, read-only UI): `uvx mlflow ui --backend-store-uri 
 
 ```bash
 uv sync                                   # Python 3.12 venv from uv.lock
-uv run pytest -q                          # 115 offline tests
+uv run pytest -q                          # 146 offline tests
 uv run ruff check . && uv run ruff format --check .
 uv run python -m src.training.run         # all stages (or --stages / --models)
 uv run uvicorn src.inference.app:app --port 8000
@@ -598,7 +667,15 @@ The test suite covers:
 - tuning and threshold logic
 - the skops allowlist
 - a registry round trip in a fresh process with no training code
-- the FastAPI contract (`TestClient`)
+- the FastAPI contract (`TestClient`), with both a fake model and a **real registered
+  random forest**:
+  - the served model has `n_jobs == 1`;
+  - the load is version-pinned;
+  - a `PAY_0` payload gets 422;
+  - out-of-range or extreme inputs get 422, never 500;
+  - batch and single-row scores match
+- per-family serialisation within the skops allowlist, and tamper refusal
+- importance units per family (gain vs MDI) and total vs conditional group importance
 - the batch client
 - import boundaries
 - Evidently parsing and alerts
@@ -630,5 +707,17 @@ their absolute artifact roots differ. The pipeline refuses to mix them and says 
   `@champion` on a fixed backtest. Today, every training run promotes its winner.
 * **Monitoring in production.** Run monitoring on a schedule over real scored batches.
   Labels arrive about a month later, so add a delayed-label join for performance metrics.
-* **Leaner serve image.** Split the dependencies into `train`/`serve` groups so the serve
-  image doesn't carry Evidently or ucimlrepo.
+* **Leaner, pinned serve image.** Split the dependencies into `train`/`serve` groups so the
+  serve image doesn't carry Evidently, matplotlib or python-pptx, and pin the base image by
+  digest.
+* **Model artifact integrity.** Sign or hash the registered model and verify it at load
+  time, on top of the skops allowlist.
+* **Per-feature permutation importance.** Measured at 7–9 s for 68 inputs, so it is left out
+  of the 45–60 s pipeline. Run it offline if per-feature attribution on held-out data is
+  needed.
+* **Duplicates across the split.** 35 duplicate feature rows (distinct customer IDs) may fall
+  on both sides of the 80/20 split. That is too few to matter, but a grouped split would rule
+  it out.
+* **`PAY_1` timing.** See §4.1. The model keeps `PAY_1`, consistent with the original paper.
+  In production it should be used only if September's status is known before the October
+  decision.

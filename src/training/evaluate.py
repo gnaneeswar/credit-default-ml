@@ -69,12 +69,33 @@ def _confusion_png(cm: np.ndarray, threshold: float, path: Path) -> None:
     plt.close(fig)
 
 
+def _native_importance(est, names: list[str]) -> tuple[np.ndarray, str]:
+    """The model's own importance, in a comparable unit per family, normalised to sum 1.
+
+    LightGBM's and XGBoost's default ``feature_importances_`` differ (LightGBM: *split
+    counts*, which favour continuous features with many thresholds regardless of loss
+    reduction), so both boosters are read explicitly as *total gain*.
+    """
+    kind = type(est).__name__
+    if kind == "LGBMClassifier":
+        raw, label = est.booster_.feature_importance(importance_type="gain"), "total gain"
+    elif kind == "XGBClassifier":
+        score = est.get_booster().get_score(importance_type="total_gain")
+        raw, label = np.array([score.get(n, 0.0) for n in names]), "total gain"
+    elif hasattr(est, "feature_importances_"):
+        raw, label = est.feature_importances_, "impurity (MDI)"
+    else:
+        raw, label = np.abs(np.ravel(est.coef_)), "|coefficient|"
+    raw = np.asarray(raw, dtype=float)
+    return raw / raw.sum() if raw.sum() > 0 else raw, label
+
+
 def feature_importance(model) -> pd.DataFrame:
     """Per-feature importance of the champion from the fitted model itself (no extra cost):
-    impurity-based MDI for tree ensembles, |coefficient| for logistic regression.
+    total gain for LightGBM / XGBoost, impurity MDI for random forest, |coefficient| for LR.
 
-    MDI is computed on training data and favours continuous / correlated features, so it is
-    paired with the holdout *group* permutation importance below, which is the robust,
+    These are computed on training data and favour continuous / correlated features, so they
+    are paired with the holdout *group* permutation importance below, which is the robust,
     model-agnostic measure.
     """
     from src.data.schema import RAW_FEATURE_GROUPS
@@ -83,10 +104,7 @@ def feature_importance(model) -> pd.DataFrame:
     raw_group = {f: g for g, feats, _ in RAW_FEATURE_GROUPS for f in feats}
     est = model[-1]
     names = [str(c) for c in model[:-1].get_feature_names_out()]
-    if hasattr(est, "feature_importances_"):
-        native, native_type = np.asarray(est.feature_importances_), "impurity (MDI)"
-    else:
-        native, native_type = np.abs(np.ravel(est.coef_)), "|coefficient|"
+    native, native_type = _native_importance(est, names)
     base = [n.removeprefix("WOE_") for n in names]
     out = pd.DataFrame(
         {
@@ -101,21 +119,33 @@ def feature_importance(model) -> pd.DataFrame:
     return out
 
 
-def _group_drop(est, Xt: pd.DataFrame, y: np.ndarray, cols: list[str], seed: int) -> float:
+def _group_drop(scorer, frame: pd.DataFrame, y: np.ndarray, cols: list[str], seed: int) -> float:
     from sklearn.metrics import roc_auc_score
 
     rng = np.random.default_rng(seed)
-    Xp = Xt.copy()
-    Xp[cols] = Xp[cols].to_numpy()[rng.permutation(len(Xp))]  # one shared row permutation
-    return float(roc_auc_score(y, est.predict_proba(Xp)[:, 1]))
+    shuffled = frame.copy()
+    shuffled[cols] = shuffled[cols].to_numpy()[rng.permutation(len(shuffled))]  # shared perm
+    return float(roc_auc_score(y, scorer.predict_proba(shuffled)[:, 1]))
 
 
 def group_importance(
     model, X: pd.DataFrame, y: np.ndarray, seed: int = 42, n_repeats: int = 3
 ) -> pd.DataFrame:
-    """Permutation importance per feature *group*: all columns of a group are shuffled
-    together (same row permutation), so correlated siblings cannot stand in for each other.
-    Reported as the mean drop in holdout ROC-AUC."""
+    """Holdout permutation importance per feature group, as the mean drop in ROC-AUC.
+
+    Two different questions, reported in the ``kind`` column:
+
+    * ``total`` (original groups): the raw input columns are shuffled *before* the full
+      pipeline, so every feature derived from them changes too. Answers "how much does the
+      model rely on this source of information?" — e.g. shuffling PAY_1..6 also scrambles
+      N_DELINQ, the roll-rate features and MAX_DELINQ_STREAK.
+    * ``conditional`` (engineered groups): the group's columns are shuffled in the engineered
+      matrix while everything else, including the raw columns they were derived from, stays
+      intact. Answers "what does this group add on top of all other inputs?". Correlated
+      inputs outside the group can stand in for it, so these values are lower bounds.
+
+    Columns inside a group always share one row permutation.
+    """
     from joblib import Parallel, delayed
     from sklearn.metrics import roc_auc_score
 
@@ -126,29 +156,33 @@ def group_importance(
     est = model[-1]
     base = float(roc_auc_score(y, est.predict_proba(Xt)[:, 1]))
     present = {str(c).removeprefix("WOE_"): str(c) for c in Xt.columns}
-    groups = []
-    for origin, catalogue in (("original", RAW_FEATURE_GROUPS), ("engineered", FEATURE_GROUPS)):
-        for name, feats, _ in catalogue:
-            cols = [present[f] for f in feats if f in present]
-            if cols:
-                groups.append((origin, name, cols))
+    groups = []  # (kind, origin, name, scorer, frame, cols)
+    for name, feats, _ in RAW_FEATURE_GROUPS:
+        cols = [f for f in feats if f in X.columns]
+        if cols:
+            groups.append(("total", "original", name, model, X, cols))
+    for name, feats, _ in FEATURE_GROUPS:
+        cols = [present[f] for f in feats if f in present]
+        if cols:
+            groups.append(("conditional", "engineered", name, est, Xt, cols))
     jobs = [
-        delayed(_group_drop)(est, Xt, y, cols, seed + r)
-        for _, _, cols in groups
+        delayed(_group_drop)(scorer, frame, y, cols, seed + r)
+        for _, _, _, scorer, frame, cols in groups
         for r in range(n_repeats)
     ]
     scores = np.array(Parallel(n_jobs=-1)(jobs)).reshape(len(groups), n_repeats)
     drops = base - scores
     out = pd.DataFrame(
         {
-            "group": [g for _, g, _ in groups],
-            "origin": [o for o, _, _ in groups],
-            "n_features": [len(c) for _, _, c in groups],
+            "group": [g[2] for g in groups],
+            "kind": [g[0] for g in groups],
+            "origin": [g[1] for g in groups],
+            "n_features": [len(g[5]) for g in groups],
             "auc_drop_mean": drops.mean(axis=1),
             "auc_drop_std": drops.std(axis=1),
         }
-    ).sort_values("auc_drop_mean", ascending=False, ignore_index=True)
-    out.insert(0, "rank", range(1, len(out) + 1))
+    ).sort_values(["kind", "auc_drop_mean"], ascending=[False, False], ignore_index=True)
+    out.insert(0, "rank", out.groupby("kind").cumcount() + 1)
     return out
 
 

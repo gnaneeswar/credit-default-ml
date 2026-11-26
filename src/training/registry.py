@@ -16,13 +16,13 @@ from sklearn.pipeline import Pipeline
 
 from src.common.config import Settings
 from src.common.logging import get_logger
-from src.common.mlflow_utils import THRESHOLD_TAG
+from src.common.mlflow_utils import THRESHOLD_TAG, is_trusted
 from src.training.threshold import ThresholdChoice
 from src.training.tune import TuneResult
 
 log = get_logger(__name__)
 
-TRUSTED_PREFIXES = ("src.features.", "sklearn.", "xgboost.", "lightgbm.", "numpy.")
+# The allowlist lives in src.common.mlflow_utils and is shared with the serving loader.
 _RUNTIME_PACKAGES = ("scikit-learn", "pandas", "numpy", "skops", "lightgbm", "xgboost")
 
 
@@ -30,7 +30,7 @@ def trusted_types(model: Pipeline) -> list[str]:
     import skops.io as sio
 
     types = sorted(sio.get_untrusted_types(data=sio.dumps(model)))
-    rejected = [t for t in types if not t.startswith(TRUSTED_PREFIXES)]
+    rejected = [t for t in types if not is_trusted(t)]
     if rejected:
         raise RuntimeError(f"refusing to trust unexpected types in the pipeline: {rejected}")
     log.info("skops trusted types (%d): %s", len(types), ", ".join(types))
@@ -56,6 +56,10 @@ def log_and_register(
 
     t0 = time.perf_counter()
     model = best.best_estimator
+    # Served single-threaded: a multi-threaded estimator would spawn a thread pool per request
+    # inside uvicorn (C1). Enforced here regardless of how the model was fitted.
+    if model.get_params().get("model__n_jobs") not in (None, 1):
+        model.set_params(model__n_jobs=1)
     # Raw canonical columns, as the API receives them (before feature engineering).
     example = X_train.head(5)
     signature = infer_signature(example, model.predict_proba(example)[:, 1])
@@ -74,7 +78,7 @@ def log_and_register(
     mv = mlflow.register_model(info.model_uri, settings.model_name)
     client = MlflowClient()
     tags = {
-        THRESHOLD_TAG: f"{choice.threshold:.6f}",
+        THRESHOLD_TAG: repr(float(choice.threshold)),  # full precision
         "model_name": best.spec.name,
         "model_family": best.spec.family,
         "cv_f1": f"{best.cv_metrics['mean_f1']:.4f}",

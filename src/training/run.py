@@ -68,7 +68,7 @@ def stage_train(ctx: Context) -> None:
 
     from src.training.models import MODEL_SPECS
     from src.training.registry import log_and_register
-    from src.training.threshold import choose_threshold, decile_table, refit_with_oof
+    from src.training.threshold import choose_threshold, decile_table, fit_families
     from src.training.tune import log_child_run, tune_model
 
     s = ctx.settings
@@ -90,39 +90,54 @@ def stage_train(ctx: Context) -> None:
         if "logistic_regression" not in {sp.name for sp in specs}:
             specs.insert(0, MODEL_SPECS["logistic_regression"])  # IV table comes from LR
         results = [tune_model(spec, X, y, cv, s, pos_weight) for spec in specs]
-        comparison = pd.DataFrame([r.summary_row() for r in results]).sort_values(
-            "cv_f1", ascending=False, ignore_index=True
-        )
-        log_table(log, "model comparison (3-fold CV, best candidate per model)", comparison)
-        best = max(results, key=lambda r: r.cv_metrics["mean_f1"])
         if "monitor" in ctx.stages and ctx.monitor_pool is None:
             from src.monitoring.run import start_worker_pool
 
             # Warm Evidently workers now; they import while the steps below run.
             ctx.monitor_pool = start_worker_pool()
+
+        # One parallel batch: OOF folds + full refit for every family. Families are then
+        # compared on the metric that is actually deployed: OOF F1 at each family's own tuned
+        # cutoff (F1@0.5 is not comparable across differently class-weighted models).
+        fits = fit_families({r.spec.name: r.template for r in results}, X, y, cv)
+        choices = {}
+        for r in results:
+            fam = fits[r.spec.name]
+            r.best_estimator = fam.model
+            choices[r.spec.name] = choose_threshold(
+                y, fam.oof, decile_table(y, fam.oof), verbose=False
+            )
+            r.oof_f1_tuned = choices[r.spec.name].f1
+            r.oof_threshold = choices[r.spec.name].threshold
         log.info(
-            "selected %s by CV F1 %.4f ± %.4f (ROC-AUC %.4f)",
+            "fitted %d families x (%d OOF folds + full refit) in parallel", len(results), s.n_splits
+        )
+        comparison = pd.DataFrame([r.summary_row() for r in results]).sort_values(
+            "oof_f1_tuned", ascending=False, ignore_index=True
+        )
+        log_table(
+            log,
+            "model comparison (3-fold CV; selection = OOF F1 at each family's own cutoff)",
+            comparison.drop(columns=["best_params"]),
+        )
+        best = max(results, key=lambda r: r.oof_f1_tuned)
+        log.info(
+            "selected %s by OOF F1 %.4f at its own cutoff %.4f (CV F1@0.5 %.4f ± %.4f)",
             best.spec.name,
+            best.oof_f1_tuned,
+            best.oof_threshold,
             best.cv_metrics["mean_f1"],
             best.cv_metrics["std_f1"],
-            best.cv_metrics["mean_roc_auc"],
         )
 
-        # One parallel batch: winner refit + its OOF folds (+ LR refit for the IV table).
         lr = next(r for r in results if r.spec.name == "logistic_regression")
-        extra = {} if best is lr else {"logistic_regression": lr.template}
-        best.best_estimator, oof, refits = refit_with_oof(best.template, X, y, cv, extra)
-        lr.best_estimator = best.best_estimator if best is lr else refits["logistic_regression"]
-        log.info(
-            "refitted %s on %d rows + %d OOF folds in parallel", best.spec.name, len(X), s.n_splits
-        )
-
         iv = lr.best_estimator.named_steps["woe"].iv_table_
         log_table(log, f"WoE/IV ranking (LR refit on full train; drop IV < {s.iv_min})", iv)
         log.info("IV kept %d / %d features", int(iv["selected"].sum()), len(iv))
 
+        oof = fits[best.spec.name].oof
         deciles = decile_table(y, oof)
-        choice = choose_threshold(y, oof, deciles)
+        choice = choose_threshold(y, oof, deciles)  # verbose log for the champion
         exp_id = tracking.result()
 
     out = s.artifacts_dir
@@ -199,7 +214,10 @@ def stage_train(ctx: Context) -> None:
             {"best_model": best.spec.name, "optimal_threshold": round(choice.threshold, 6)}
         )
         mlflow.log_metrics({f"best_cv_{k}": v for k, v in best.cv_metrics.items()})
-        mlflow.log_metrics({f"oof_{k}": v for k, v in choice.as_dict().items()})
+        mlflow.log_metrics(
+            {f"oof_{k}": v for k, v in choice.as_dict().items() if isinstance(v, int | float)}
+        )
+        mlflow.set_tag("threshold_source", choice.source)
         log_and_register(best, X, choice, s)
 
     # Hand-off data for the batch client and monitoring (gitignored artifacts).

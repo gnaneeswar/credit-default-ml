@@ -29,6 +29,7 @@ from src.inference.schemas import (
     InvocationRequest,
     InvocationResponse,
     Prediction,
+    rule_violations,
 )
 
 log = get_logger("inference.app")
@@ -51,7 +52,8 @@ def create_app(loader: Loader | None = None) -> FastAPI:
             app.state.model, app.state.info = loader()
             log.info("serving %s", app.state.info.as_dict())
         except Exception as exc:  # keep the process up so /health can explain the failure
-            app.state.load_error = f"{type(exc).__name__}: {exc}"
+            # Details (paths, URIs) go to the server log only, never to API clients.
+            app.state.load_error = f"{type(exc).__name__}: model could not be loaded"
             log.exception("model load failed; /invocations will return 503")
         yield
 
@@ -121,7 +123,24 @@ def create_app(loader: Loader | None = None) -> FastAPI:
         # Reorder to the training-time column order (sklearn checks feature names *and*
         # order) and cast to the signed dtype (float64).
         frame = pd.DataFrame(split.data, columns=split.columns)[expected].astype("float64")
-        proba = np.asarray(model.predict_proba(frame)[:, 1], dtype=float)
+        n_bad, violations = rule_violations(frame)
+        if n_bad:
+            log.warning("rejected request: %d out-of-range values, e.g. %s", n_bad, violations[:2])
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "values outside the allowed ranges",
+                    "n_violations": n_bad,
+                    "violations": violations,
+                },
+            )
+        try:
+            proba = np.asarray(model.predict_proba(frame)[:, 1], dtype=float)
+        except ValueError as exc:  # defence in depth: never surface a scoring error as a 500
+            log.warning("rejected request: model could not score input: %s", exc)
+            raise HTTPException(
+                status_code=422, detail={"error": "input could not be scored"}
+            ) from exc
         pred = (proba >= info.threshold).astype(int)
 
         elapsed_ms = (time.perf_counter() - start) * 1000

@@ -19,7 +19,6 @@ The unconstrained fine-grained F1 optimum and the default 0.5 are reported for c
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -49,6 +48,7 @@ class ThresholdChoice:
     fine_threshold: float
     fine_f1: float
     f1_at_050: float
+    source: str = "percentile"  # "percentile" (flag top q%) or "default_0.5"
 
     def as_dict(self) -> dict:
         return dict(self.__dict__)
@@ -58,43 +58,42 @@ def _fit(estimator: Pipeline, X: pd.DataFrame, y: pd.Series) -> Pipeline:
     return estimator.fit(X, y)
 
 
-def refit_with_oof(
-    template: Pipeline,
-    X: pd.DataFrame,
-    y: pd.Series,
-    cv: StratifiedKFold,
-    extra: dict[str, Pipeline] | None = None,
-) -> tuple[Pipeline, np.ndarray, dict[str, Pipeline]]:
-    """One parallel batch: full-train refit of the winner, its k out-of-fold fits, and any
-    ``extra`` full-train refits (e.g. LR for the IV table).
+@dataclass
+class FamilyFit:
+    model: Pipeline  # refitted on the full training split, n_jobs=1 (servable as-is)
+    oof: np.ndarray  # out-of-fold P(default) for every training row
 
-    Equivalent to ``refit`` + ``cross_val_predict(method="predict_proba")`` with the same
-    splitter, but the k+1+len(extra) independent fits run concurrently instead of serially.
-    Returns (refitted winner, OOF P(default) for every training row, refitted extras).
+
+def fit_families(
+    templates: dict[str, Pipeline], X: pd.DataFrame, y: pd.Series, cv: StratifiedKFold
+) -> dict[str, FamilyFit]:
+    """One parallel batch: for every candidate family, k out-of-fold fits + 1 full refit.
+
+    Equivalent to ``cross_val_predict(method="predict_proba")`` + ``refit`` per family with
+    the same splitter, but all (k + 1) x families fits run concurrently. Every estimator keeps
+    the ``n_jobs=1`` it was built with, so the refitted models are logged/served
+    single-threaded (no per-request thread pools inside the API).
     """
     folds = list(cv.split(X, y))
-    extra = extra or {}
-    # The full-data refit is the longest job in this batch; give it the cores the other
-    # fits leave idle, then restore n_jobs=1 so the logged/served model is single-threaded.
-    spare = max(1, (os.cpu_count() or 1) - len(folds) - len(extra))
-    full = clone(template)
-    threaded = full.get_params().get("model__n_jobs") == 1  # tree models we pinned explicitly
-    if threaded:
-        full.set_params(model__n_jobs=spare)
-    jobs = [delayed(_fit)(full, X, y)]
-    jobs += [delayed(_fit)(clone(template), X.iloc[tr], y.iloc[tr]) for tr, _ in folds]
-    jobs += [delayed(_fit)(clone(est), X, y) for est in extra.values()]
+    jobs, index = [], []
+    for name, template in templates.items():
+        jobs.append(delayed(_fit)(clone(template), X, y))
+        index.append((name, None))
+        for i, (tr, _) in enumerate(folds):
+            jobs.append(delayed(_fit)(clone(template), X.iloc[tr], y.iloc[tr]))
+            index.append((name, i))
     fitted = Parallel(n_jobs=-1)(jobs)
 
-    winner, fold_models, extra_fitted = (
-        fitted[0],
-        fitted[1 : 1 + len(folds)],
-        fitted[1 + len(folds) :],
-    )
-    oof = np.empty(len(X), dtype=float)
-    for model, (_, te) in zip(fold_models, folds, strict=True):
-        oof[te] = model.predict_proba(X.iloc[te])[:, 1]
-    return winner, oof, dict(zip(extra, extra_fitted, strict=True))
+    out: dict[str, FamilyFit] = {}
+    for name in templates:
+        full = next(m for (n, i), m in zip(index, fitted, strict=True) if n == name and i is None)
+        oof = np.empty(len(X), dtype=float)
+        for (n, i), m in zip(index, fitted, strict=True):
+            if n == name and i is not None:
+                te = folds[i][1]
+                oof[te] = m.predict_proba(X.iloc[te])[:, 1]
+        out[name] = FamilyFit(model=full, oof=oof)
+    return out
 
 
 DECILE_COLUMNS = [
@@ -185,20 +184,28 @@ def _metrics_at(y: np.ndarray, proba: np.ndarray, cutoff: float) -> tuple[float,
 
 
 def choose_threshold(
-    y: pd.Series | np.ndarray, proba: np.ndarray, table: pd.DataFrame
+    y: pd.Series | np.ndarray, proba: np.ndarray, table: pd.DataFrame, verbose: bool = True
 ) -> ThresholdChoice:
+    """Coarse-to-fine cutoff on OOF scores, with the default 0.5 as an explicit candidate.
+
+    Candidates = "flag the top q%" for q in the window around the best decile, plus 0.5.
+    The highest OOF F1 wins; ties go to 0.5 (no tuning unless it actually helps).
+    """
     y = np.asarray(y, dtype=int)
     best_decile = table.loc[table["f1"].idxmax()]
     k = int(best_decile["decile"])
 
-    # Percentile refinement inside deciles k-1..k+1 ("flag the top q%").
+    # Percentile refinement inside deciles k-1..k+1 ("flag the top q%"), plus 0.5.
     q_lo, q_hi = max(1, 10 * (k - 1)), min(100, 10 * (k + 1))
-    candidates = []
+    candidates = []  # (f1, prefer_default, cutoff, precision, recall, source)
     for q in range(q_lo, q_hi + 1):
         cutoff = float(np.quantile(proba, 1 - q / 100))
         f1, precision, recall = _metrics_at(y, proba, cutoff)
-        candidates.append((f1, q, cutoff, precision, recall))
-    f1, q, cutoff, precision, recall = max(candidates)
+        candidates.append((f1, 0, cutoff, precision, recall, "percentile"))
+    f1, precision, recall = _metrics_at(y, proba, 0.5)
+    candidates.append((f1, 1, 0.5, precision, recall, "default_0.5"))
+    f1, _, cutoff, precision, recall, source = max(candidates)
+    flagged = float((proba >= cutoff).mean())
 
     prec, rec, thr = precision_recall_curve(y, proba)
     f1s = np.where(prec + rec > 0, 2 * prec * rec / np.maximum(prec + rec, 1e-12), 0.0)[:-1]
@@ -207,36 +214,40 @@ def choose_threshold(
         threshold=cutoff,
         deciles_flagged=k,
         decile_f1=float(best_decile["f1"]),
-        top_percent_flagged=q,
+        top_percent_flagged=int(round(100 * flagged)),
         f1=f1,
         precision=precision,
         recall=recall,
-        flagged_share=float((proba >= cutoff).mean()),
+        flagged_share=flagged,
         fine_threshold=float(thr[j]),
         fine_f1=float(f1s[j]),
         f1_at_050=float(f1_score(y, proba >= 0.5)),
+        source=source,
     )
-    log_table(log, "OOF decile analysis (decile 1 = riskiest)", table)
-    log.info(
-        "coarse: best = flag top %d deciles (cutoff %.4f, F1=%.4f)",
-        k,
-        float(best_decile["cutoff"]),
-        choice.decile_f1,
-    )
-    log.info(
-        "fine: flag top %d%% -> cutoff=%.4f  F1=%.4f  P=%.4f  R=%.4f  (searched top %d%%..%d%%)",
-        q,
-        cutoff,
-        f1,
-        precision,
-        recall,
-        q_lo,
-        q_hi,
-    )
-    log.info(
-        "reference: unconstrained optimum %.4f F1=%.4f · default 0.5 F1=%.4f",
-        choice.fine_threshold,
-        choice.fine_f1,
-        choice.f1_at_050,
-    )
+    if verbose:
+        log_table(log, "OOF decile analysis (decile 1 = riskiest)", table)
+        log.info(
+            "coarse: best = flag top %d deciles (cutoff %.4f, F1=%.4f)",
+            k,
+            float(best_decile["cutoff"]),
+            choice.decile_f1,
+        )
+        log.info(
+            "chosen: %s cutoff=%.4f (flags %.1f%%)  F1=%.4f  P=%.4f  R=%.4f  "
+            "(candidates: top %d%%..%d%% + default 0.5)",
+            source,
+            cutoff,
+            100 * flagged,
+            f1,
+            precision,
+            recall,
+            q_lo,
+            q_hi,
+        )
+        log.info(
+            "reference: unconstrained optimum %.4f F1=%.4f · default 0.5 F1=%.4f",
+            choice.fine_threshold,
+            choice.fine_f1,
+            choice.f1_at_050,
+        )
     return choice

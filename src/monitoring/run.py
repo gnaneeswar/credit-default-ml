@@ -142,6 +142,7 @@ def run_monitoring(
             "drift_share_alert": drift.DRIFT_SHARE_ALERT,
             "f1_drop_alert": drift.F1_DROP_ALERT,
             "accuracy_drop_alert": drift.ACCURACY_DROP_ALERT,
+            "score_psi_alert": drift.SCORE_PSI_ALERT,
         },
         "scenarios": results,
     }
@@ -153,12 +154,14 @@ def run_monitoring(
                 "flagged": r["flagged_share"],
                 "drift_share": r["drift_share"],
                 "drifted_cols": r["drifted_count"],
+                "score_psi": r["score_psi"],
                 "f1": r["classification"].get("f1"),
                 "Δf1": -r["f1_drop"],
                 "accuracy": r["classification"].get("accuracy"),
                 "Δacc": -r["accuracy_drop"],
                 "drift_alert": r["alerts"]["data_drift"],
                 "perf_alert": r["alerts"]["f1_drop"] or r["alerts"]["accuracy_drop"],
+                "score_alert": r["alerts"]["score_drift"],
             }
             for r in results
         ]
@@ -191,6 +194,7 @@ def _log_to_mlflow(settings: Settings, info, results, paths) -> None:
                 {
                     f"{n}_drift_share": s["drift_share"],
                     f"{n}_drifted_count": s["drifted_count"],
+                    f"{n}_score_psi": s["score_psi"],
                     f"{n}_f1": s["classification"].get("f1", float("nan")),
                     f"{n}_accuracy": s["classification"].get("accuracy", float("nan")),
                     f"{n}_alert": float(any(s["alerts"].values())),

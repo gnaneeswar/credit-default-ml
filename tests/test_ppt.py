@@ -76,6 +76,9 @@ def write_synthetic_artifacts(d: Path, holdout_f1: float = 0.6123) -> None:
             }
         },
     }
+    eda["code_counts_full"] = {  # label-free full-data counts (deck "rows affected")
+        col: {str(r[col]): r["count"] for r in rows} for col, rows in eda["code_tables"].items()
+    }
     (d / "eda_summary.json").write_text(json.dumps(eda))
     all_features = [*FEATURES, *ENGINEERED]
     ivs = np.r_[[0.88, 0.87, 0.85, 0.13], rng.uniform(0.0, 0.3, len(all_features) - 4)]
@@ -110,6 +113,7 @@ def write_synthetic_artifacts(d: Path, holdout_f1: float = 0.6123) -> None:
             "rank": range(1, len(groups) + 1),
             "group": groups,
             "origin": ["original"] * len(RAW_FEATURE_GROUPS) + ["engineered"] * len(FEATURE_GROUPS),
+            "kind": ["total"] * len(RAW_FEATURE_GROUPS) + ["conditional"] * len(FEATURE_GROUPS),
             "n_features": 3,
             "auc_drop_mean": np.linspace(0.016, 0.0, len(groups)),
             "auc_drop_std": 0.001,
@@ -128,13 +132,17 @@ def write_synthetic_artifacts(d: Path, holdout_f1: float = 0.6123) -> None:
                 "cv_f1_std": 0.005,
                 "n_candidates": 4,
                 "seconds": 1.0,
+                "oof_f1_tuned": oof,
+                "oof_threshold": 0.52,
                 "best_params": json.dumps(bp),
             }
-            for m, f1, bp in [
-                ("random_forest", 0.549, {"max_depth": 12, "min_samples_leaf": 10}),
-                ("xgboost", 0.545, {"learning_rate": 0.05, "max_depth": 3}),
-                ("lightgbm", 0.543, {"learning_rate": 0.05, "num_leaves": 31}),
-                ("logistic_regression", 0.535, {"C": 10.0, "class_weight": "balanced"}),
+            # CV F1@0.5 would pick the RF; the deployed metric (OOF F1 at own cutoff) picks
+            # XGBoost — the deck must follow the deployed metric.
+            for m, f1, oof, bp in [
+                ("random_forest", 0.549, 0.5470, {"max_depth": 12, "min_samples_leaf": 10}),
+                ("xgboost", 0.545, 0.5475, {"learning_rate": 0.05, "max_depth": 3}),
+                ("lightgbm", 0.543, 0.5472, {"learning_rate": 0.05, "num_leaves": 31}),
+                ("logistic_regression", 0.535, 0.5400, {"C": 10.0, "class_weight": "balanced"}),
             ]
         ]
     ).to_csv(d / "cv_comparison.csv", index=False)
@@ -284,7 +292,7 @@ def test_numbers_come_from_artifacts(tmp_path) -> None:
     holdout = next(r for r in range(len(table.rows)) if table.cell(r, 0).text.startswith("Hold"))
     assert table.cell(holdout, f1_col).text == "0.6123"
     cover = " ".join(s.text_frame.text for s in prs.slides[0].shapes if s.has_text_frame)
-    assert "0.612" in cover and "Random Forest" in cover
+    assert "0.612" in cover and "XGBoost" in cover  # champion by the deployed metric
 
 
 def test_missing_inputs_and_overflow_fail_loudly(tmp_path) -> None:
@@ -328,8 +336,11 @@ def test_selection_slide_shows_steps_and_both_importances(deck) -> None:
     assert len(_table_rows(sl, "table:feature_importance")) == 13
     body = next(s for s in sl.shapes if s.name == "body").text_frame.text
     assert "IV ≥ 0.02" in body and "no pre-filter" in body
-    top_group = RAW_FEATURE_GROUPS[0][0]  # ranked first in the synthetic group importance
-    assert f"{top_group} matters most" in body
+    top_total = RAW_FEATURE_GROUPS[0][0]  # first "total" row in the synthetic importance
+    assert "total (raw source shuffled through the pipeline)" in body and top_total in body
+    kinds = [r[1] for r in _table_rows(sl, "table:group_importance")[1:]]
+    assert kinds[: len(RAW_FEATURE_GROUPS)] == ["total"] * len(RAW_FEATURE_GROUPS)
+    assert set(kinds[len(RAW_FEATURE_GROUPS) :]) == {"cond."}
 
 
 def test_compact_series() -> None:
@@ -337,3 +348,9 @@ def test_compact_series() -> None:
     assert ppt._compact(["BILL_AMT1", "BILL_AMT2", "BILL_AMT3", "SEX"]) == "BILL_AMT1–3, SEX"
     assert ppt._compact(["PAY_1", "PAY_3"]) == "PAY_1, PAY_3"  # not consecutive
     assert ppt._compact(["SPEND_1", "SPEND_MEAN_3"]) == "SPEND_1, SPEND_MEAN_3"
+
+
+def test_top3_ranked_by_deployed_metric(deck) -> None:
+    rows = _table_rows(slide(deck, "top3"), "table:top3")
+    assert rows[0][3] == "OOF F1 @ own cutoff"
+    assert [r[1] for r in rows[1:]] == ["XGBoost", "LightGBM", "Random Forest"]

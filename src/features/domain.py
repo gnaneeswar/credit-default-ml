@@ -21,7 +21,10 @@ PAY_AMT = [f"PAY_AMT{i}" for i in range(1, 7)]
 EDUCATION_REMAP = {0: 4, 5: 4, 6: 4}  # undocumented -> 'others'
 MARRIAGE_REMAP = {0: 3}  # undocumented -> 'others'
 
-COVER_CLIP = 5.0  # payment can exceed the prior bill (prepayment); cap the long tail
+COVER_CLIP = 5.0
+_FLOAT32_MAX = float(
+    np.finfo(np.float32).max
+)  # payment can exceed the prior bill (prepayment); cap the long tail
 
 
 def _require(X: pd.DataFrame, cols: list[str], who: str) -> None:
@@ -151,17 +154,21 @@ FEATURE_GROUPS: list[tuple[str, list[str], str]] = [
         ["SPEND_1", "SPEND_MEAN_3", "SPEND_MEAN_5"],
         "BILL_n − (BILL_(n+1) − PAY_AMT_n): latest, 3- and 5-month means",
     ),
-    ("Cure", ["CURED_RECENT", "N_CURES"], "PAY_(n+1) ≥ 2 → PAY_n ≤ 0: latest flag, count"),
+    ("Cure", ["CURED_RECENT", "N_CURES"], "PAY_(n+1) ≥ 2 → PAY_n ≤ 0: latest flag, history count"),
     (
         "Roll forward",
         ["ROLL_FWD_RECENT", "N_ROLL_FWD", "MAX_ROLL_FWD_STEP", "N_DORMANT_TO_REVOLVER"],
-        "Worsening into delinquency (cur ≥ 1): flag, count, max step; −2 → 0 count",
+        "Worsening (cur ≥ 1): latest flag; history count, max step; −2 → 0 count",
     ),
-    ("Roll backward", ["ROLL_BACK_RECENT", "N_ROLL_BACK"], "Improving while still past due"),
+    (
+        "Roll backward",
+        ["ROLL_BACK_RECENT", "N_ROLL_BACK"],
+        "Improving while still past due: latest flag, history count",
+    ),
     (
         "Stagnation",
         ["STAGNANT_RECENT", "N_STAGNANT", "MAX_DELINQ_STREAK"],
-        "Same status ≥ 2 month to month; longest run of PAY ≥ 2",
+        "Same status ≥ 2: latest flag, history count; longest run of PAY ≥ 2",
     ),
 ]
 FEATURE_TO_GROUP: dict[str, str] = {f: g for g, feats, _ in FEATURE_GROUPS for f in feats}
@@ -217,10 +224,13 @@ class DomainFeatureEngineer(_StatelessFrameTransformer):
       ``SPEND_1`` (latest), ``SPEND_MEAN_3`` / ``SPEND_MEAN_5`` (rolling means that smooth
       calendar-month vs statement-cutoff payment timing; sign preserved)
 
-    Roll rates over the 5 consecutive transitions prev = PAY_(n+1) -> cur = PAY_n, moving
-    forward in time from PAY_6 to PAY_1 (``*_RECENT`` = the PAY_2 -> PAY_1 transition):
+    Roll rates over consecutive transitions prev = PAY_(n+1) -> cur = PAY_n, moving forward
+    in time. ``*_RECENT`` = the latest transition (PAY_2 -> PAY_1); ``N_*`` counts and
+    ``MAX_ROLL_FWD_STEP`` cover only the 4 history transitions (PAY_6 -> ... -> PAY_2), whose
+    status coding is consistent (code 1 appears almost only in PAY_1):
 
-    * cure: prev >= 2 and cur <= 0 -> ``CURED_RECENT``, ``N_CURES``
+    * cure: prev >= 2 and cur <= 0 -> ``CURED_RECENT``, ``N_CURES``. Deliberately requires
+      prev >= 2: recovering from a single missed due date (1 -> <= 0) is not counted as a cure
     * roll forward (worsening): cur > prev and cur >= 1 -> ``ROLL_FWD_RECENT``, ``N_ROLL_FWD``,
       ``MAX_ROLL_FWD_STEP`` = max(cur - max(prev, 0)). Moves among non-delinquent codes are
       not worsening; ``-2 -> 2`` is a step of 2 missed due dates, not 4.
@@ -237,8 +247,17 @@ class DomainFeatureEngineer(_StatelessFrameTransformer):
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         _require(X, self.required, type(self).__name__)
+        raw = X[self.required].to_numpy(dtype=float)
+        ok = np.isfinite(raw) & (np.abs(raw) <= _FLOAT32_MAX)  # trees cast inputs to float32
+        if not ok.all():
+            bad = [c for c, good in zip(self.required, ok.all(0), strict=True) if not good]
+            raise ValueError(
+                f"DomainFeatureEngineer: non-finite or beyond-float32 input values in {bad}"
+            )
         limit = X["LIMIT_BAL"].to_numpy(dtype=float)
-        limit = np.where(limit > 0, limit, np.nan)  # never divide by a non-positive limit
+        # Defence in depth: the API rejects LIMIT_BAL < 1, so a non-positive limit can only
+        # come from a direct caller; its ratio features are set to 0 rather than +/-inf.
+        limit = np.where(limit > 0, limit, np.nan)
         bills = X[BILL_AMT].to_numpy(dtype=float)
         pays = X[PAY_AMT].to_numpy(dtype=float)
         status = X[PAY_STATUS].to_numpy(dtype=float)
@@ -269,8 +288,11 @@ class DomainFeatureEngineer(_StatelessFrameTransformer):
             **self._roll_rates(status),
         }
         engineered = pd.DataFrame(feats, index=X.index)[ENGINEERED].astype(float)
-        # Only a non-positive LIMIT_BAL (never observed) can yield NaN; neutralise it.
-        engineered = engineered.fillna(0.0)
+        engineered = engineered.fillna(0.0)  # only the non-positive-limit guard yields NaN here
+        values = engineered.to_numpy()
+        if not np.isfinite(values).all() or np.abs(values).max(initial=0) > _FLOAT32_MAX:
+            # e.g. a tiny positive LIMIT_BAL: ratios overflow the float32 that trees use.
+            raise ValueError("DomainFeatureEngineer: engineered features out of float32 range")
         return pd.concat([X, engineered], axis=1)
 
     @staticmethod
@@ -300,16 +322,22 @@ class DomainFeatureEngineer(_StatelessFrameTransformer):
         roll_fwd = (cur > prev) & (cur >= 1)
         roll_back = (cur < prev) & (cur > 0) & (prev > 0)
         stagnant = (cur == prev) & (cur >= 2)
+        # The latest transition uses a different code-1 convention (code 1 exists almost only
+        # in PAY_1), so it is kept OUT of the 6-month counts: N_* / MAX_ROLL_FWD_STEP count the
+        # 4 consistently coded history transitions (PAY_6 -> ... -> PAY_2); the latest one is
+        # captured only by the *_RECENT flags. No double counting, one coding regime per feature.
+        hist = slice(None, -1)
+        step = np.where(roll_fwd, cur - np.maximum(prev, 0), 0)
         return {
             "CURED_RECENT": cure[:, -1],
-            "N_CURES": cure.sum(axis=1),
+            "N_CURES": cure[:, hist].sum(axis=1),
             "ROLL_FWD_RECENT": roll_fwd[:, -1],
-            "N_ROLL_FWD": roll_fwd.sum(axis=1),
-            "MAX_ROLL_FWD_STEP": np.where(roll_fwd, cur - np.maximum(prev, 0), 0).max(axis=1),
-            "N_DORMANT_TO_REVOLVER": ((prev == -2) & (cur == 0)).sum(axis=1),
+            "N_ROLL_FWD": roll_fwd[:, hist].sum(axis=1),
+            "MAX_ROLL_FWD_STEP": step[:, hist].max(axis=1),
+            "N_DORMANT_TO_REVOLVER": ((prev == -2) & (cur == 0))[:, hist].sum(axis=1),
             "ROLL_BACK_RECENT": roll_back[:, -1],
-            "N_ROLL_BACK": roll_back.sum(axis=1),
+            "N_ROLL_BACK": roll_back[:, hist].sum(axis=1),
             "STAGNANT_RECENT": stagnant[:, -1],
-            "N_STAGNANT": stagnant.sum(axis=1),
+            "N_STAGNANT": stagnant[:, hist].sum(axis=1),
             "MAX_DELINQ_STREAK": _longest_run(chrono >= 2),
         }

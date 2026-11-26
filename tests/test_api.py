@@ -45,7 +45,8 @@ def client() -> TestClient:
 
 
 def _row(pay_1: int = 0) -> list[int]:
-    row = dict.fromkeys(FEATURES, 1000)
+    row = dict.fromkeys(FEATURES, 1000)  # limit / bills / payments
+    row.update({f"PAY_{i}": 0 for i in range(2, 7)})  # valid status codes
     row.update(SEX=1, EDUCATION=2, MARRIAGE=1, AGE=30, PAY_1=pay_1)
     return [row[c] for c in FEATURES]
 
@@ -71,7 +72,10 @@ def test_health_and_invocations_503_when_model_missing() -> None:
     with TestClient(create_app(loader=broken)) as c:
         r = c.get("/health")
         assert r.status_code == 503
-        assert r.json()["model_loaded"] is False and "champion" in r.json()["error"]
+        body = r.json()
+        assert body["model_loaded"] is False
+        assert body["error"] == "RuntimeError: model could not be loaded"
+        assert "alias" not in body["error"]  # internals (paths, URIs, messages) stay in logs
         assert c.post("/invocations", json=_payload([_row()])).status_code == 503
 
 
@@ -198,3 +202,81 @@ def test_app_serves_real_registered_champion(small_xy, tiny_champion) -> None:
     assert r.status_code == 200
     got = [p["default_probability"] for p in r.json()["predictions"]]
     np.testing.assert_allclose(got, pipe.predict_proba(rows)[:, 1], rtol=1e-9)
+
+
+# ------------------------------------------- real tree champion through the real loader
+def _real_rows(X, n: int = 3) -> list[list[float]]:
+    return X.head(n)[FEATURES].astype(float).values.tolist()
+
+
+@pytest.fixture
+def rf_client(tiny_rf_champion):
+    with TestClient(create_app(), raise_server_exceptions=False) as c:
+        yield c
+
+
+def test_served_tree_model_is_single_threaded_and_version_pinned(tiny_rf_champion) -> None:
+    from src.common.config import Settings
+    from src.common.mlflow_utils import load_champion
+
+    _, version, _ = tiny_rf_champion
+    model, info = load_champion(Settings())
+    assert model.named_steps["model"].n_jobs == 1  # registry forced it (fitted with 4)
+    assert info.model_uri.endswith(f"/{version}") and "@" not in info.model_uri
+    assert info.threshold == pytest.approx(TINY_THRESHOLD)
+    assert info.trusted_types and all(
+        t.startswith(("src.", "sklearn.")) for t in info.trusted_types
+    )
+
+
+def test_real_model_batch_and_single_row_scores_match(rf_client, small_xy) -> None:
+    X, _ = small_xy
+    rows = _real_rows(X, 50)
+    batch = rf_client.post("/invocations", json=_payload(rows)).json()["predictions"]
+    for i in (0, 17, 49):
+        single = rf_client.post("/invocations", json=_payload([rows[i]])).json()["predictions"]
+        assert single[0]["default_probability"] == pytest.approx(
+            batch[i]["default_probability"], abs=1e-12
+        )
+
+
+def test_pre_rename_pay_0_payload_is_rejected(rf_client, small_xy) -> None:
+    X, _ = small_xy
+    cols = ["PAY_0" if c == "PAY_1" else c for c in FEATURES]
+    r = rf_client.post("/invocations", json=_payload(_real_rows(X, 1), cols))
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["missing_columns"] == ["PAY_1"] and detail["unknown_columns"] == ["PAY_0"]
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "fragment"),
+    [
+        ("LIMIT_BAL", 10**400, "magnitude"),  # OverflowError before the fix
+        ("BILL_AMT1", 1e39, "magnitude"),  # float32 overflow in the trees before the fix
+        ("LIMIT_BAL", 1e-300, "credit limit"),  # tiny limit -> inf ratios before the fix
+        ("LIMIT_BAL", -5000, "credit limit"),
+        ("EDUCATION", 7.5, "integer code 0..6"),
+        ("PAY_1", 42, "integer status"),
+        ("PAY_AMT3", -1, "payment"),
+        ("SEX", 3, "1 or 2"),
+        ("AGE", 12, "integer age"),
+    ],
+)
+def test_out_of_contract_inputs_get_422_never_500(rf_client, small_xy, column, value, fragment):
+    X, _ = small_xy
+    row = _real_rows(X, 1)[0]
+    row[FEATURES.index(column)] = value
+    body = json.dumps(_payload([row]))  # json.dumps: allows the 10**400 integer literal
+    r = rf_client.post("/invocations", content=body, headers={"Content-Type": "application/json"})
+    assert r.status_code == 422, r.text
+    assert fragment in r.text
+
+
+def test_violation_report_is_bounded(rf_client, small_xy) -> None:
+    X, _ = small_xy
+    rows = _real_rows(X, 40)
+    for row in rows:
+        row[FEATURES.index("SEX")] = 9
+    detail = rf_client.post("/invocations", json=_payload(rows)).json()["detail"]
+    assert detail["n_violations"] == 40 and len(detail["violations"]) == 20
