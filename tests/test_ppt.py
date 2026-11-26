@@ -12,10 +12,16 @@ from pptx import Presentation
 from pptx.util import Emu
 
 from src.common.config import Settings
+from src.data.schema import FEATURES, RAW_FEATURE_GROUPS
+from src.features.domain import ENGINEERED, FEATURE_GROUPS
 from src.reporting import ppt
 from src.training.models import MODEL_SPECS
 
 TOP_PERCENT = 26  # -> operating decile 3
+
+
+def slide(prs, key: str):
+    return prs.slides[ppt.SLIDE_ORDER.index(key)]
 
 
 def write_synthetic_artifacts(d: Path, holdout_f1: float = 0.6123) -> None:
@@ -32,6 +38,9 @@ def write_synthetic_artifacts(d: Path, holdout_f1: float = 0.6123) -> None:
         "shapes": {"full": [30000, 24], "train": [24000, 24], "test": [6000, 24]},
         "total_missing": 0,
         "duplicate_rows": 35,
+        "negative_bill_rows": 1930,
+        "zero_bill_all_months_rows": 866,
+        "numeric_distributions": {"LIMIT_BAL": {"min": 10000.0}},
         "target_balance": {"default_rate_full": 0.2212, "imbalance_ratio_neg_to_pos": 3.52},
         "code_tables": {
             "EDUCATION": codes(
@@ -68,15 +77,44 @@ def write_synthetic_artifacts(d: Path, holdout_f1: float = 0.6123) -> None:
         },
     }
     (d / "eda_summary.json").write_text(json.dumps(eda))
+    all_features = [*FEATURES, *ENGINEERED]
+    ivs = np.r_[[0.88, 0.87, 0.85, 0.13], rng.uniform(0.0, 0.3, len(all_features) - 4)]
+    ivs[-5:] = 0.01  # a few dropped features
     pd.DataFrame(
         {
-            "feature": ["PAY_1", "N_DELINQ", "MAX_DELINQ_STREAK", "UTIL_MEAN", "BILL_AMT1"],
-            "iv": [0.88, 0.87, 0.85, 0.13, 0.015],
-            "n_bins": [6, 6, 6, 10, 10],
-            "strength": ["very strong (verify)"] * 3 + ["medium", "useless"],
-            "selected": [True, True, True, True, False],
+            "feature": ["PAY_1", "N_DELINQ", "MAX_DELINQ_STREAK", "UTIL_MEAN"]
+            + [
+                f
+                for f in all_features
+                if f not in {"PAY_1", "N_DELINQ", "MAX_DELINQ_STREAK", "UTIL_MEAN"}
+            ],
+            "iv": ivs,
+            "n_bins": 6,
+            "strength": "medium",
+            "selected": ivs >= 0.02,
         }
     ).to_csv(d / "iv_table.csv", index=False)
+    pd.DataFrame(
+        {
+            "rank": range(1, 16),
+            "feature": all_features[:15],
+            "origin": ["original"] * 15,
+            "group": "Repayment status",
+            "importance": np.linspace(0.09, 0.01, 15),
+            "importance_type": "impurity (MDI)",
+        }
+    ).to_csv(d / "feature_importance.csv", index=False)
+    groups = [g for g, _, _ in RAW_FEATURE_GROUPS] + [g for g, _, _ in FEATURE_GROUPS]
+    pd.DataFrame(
+        {
+            "rank": range(1, len(groups) + 1),
+            "group": groups,
+            "origin": ["original"] * len(RAW_FEATURE_GROUPS) + ["engineered"] * len(FEATURE_GROUPS),
+            "n_features": 3,
+            "auc_drop_mean": np.linspace(0.016, 0.0, len(groups)),
+            "auc_drop_std": 0.001,
+        }
+    ).to_csv(d / "feature_group_importance.csv", index=False)
     pd.DataFrame(
         [
             {
@@ -110,6 +148,7 @@ def write_synthetic_artifacts(d: Path, holdout_f1: float = 0.6123) -> None:
             "scoring": "f1",
             "n_jobs": -1,
         },
+        "selection": {"iv_min": 0.02},
         "models": [s.describe(Settings(), 3.52) for s in MODEL_SPECS.values()],
     }
     (d / "model_grids.json").write_text(json.dumps(grids))
@@ -170,7 +209,7 @@ def _tables(slide):
 
 
 def test_slide_count_titles_and_widescreen(deck) -> None:
-    assert len(deck.slides) == 5
+    assert len(deck.slides) == 8
     assert (Emu(deck.slide_width).inches, Emu(deck.slide_height).inches) == pytest.approx(
         (13.333, 7.5), abs=1e-3
     )
@@ -219,7 +258,7 @@ def test_minimum_font_sizes(deck) -> None:
 
 @pytest.mark.parametrize("name", ["table:deciles_train", "table:deciles_test"])
 def test_alternating_fills_and_operating_decile_highlight(deck, name: str) -> None:
-    deciles = next(s for s in deck.slides[4].shapes if s.name == name).table
+    deciles = next(s for s in slide(deck, "results").shapes if s.name == name).table
     assert len(deciles.rows) == 11 and deciles.cell(0, 0).fill.fore_color.rgb == ppt.NAVY
     k = math.ceil(TOP_PERCENT / 10)  # operating decile, highlighted in both tables
     for i in range(10):
@@ -228,7 +267,7 @@ def test_alternating_fills_and_operating_decile_highlight(deck, name: str) -> No
 
 
 def test_results_slide_shows_train_and_holdout_deciles(deck) -> None:
-    shapes = {s.name: s for s in deck.slides[4].shapes}
+    shapes = {s.name: s for s in slide(deck, "results").shapes}
     assert {"table:metrics", "table:deciles_train", "table:deciles_test"} <= set(shapes)
     train, test = shapes["table:deciles_train"], shapes["table:deciles_test"]
     assert train.top == test.top and train.left < test.left  # side by side
@@ -240,7 +279,7 @@ def test_results_slide_shows_train_and_holdout_deciles(deck) -> None:
 def test_numbers_come_from_artifacts(tmp_path) -> None:
     write_synthetic_artifacts(tmp_path, holdout_f1=0.6123)
     prs = Presentation(str(ppt.build_deck(ppt.load_inputs(tmp_path), tmp_path / "d.pptx")))
-    table = next(s for s in prs.slides[4].shapes if s.name == "table:metrics").table
+    table = next(s for s in slide(prs, "results").shapes if s.name == "table:metrics").table
     f1_col = next(c for c in range(len(table.columns)) if table.cell(0, c).text == "F1")
     holdout = next(r for r in range(len(table.rows)) if table.cell(r, 0).text.startswith("Hold"))
     assert table.cell(holdout, f1_col).text == "0.6123"
@@ -256,3 +295,45 @@ def test_missing_inputs_and_overflow_fail_loudly(tmp_path) -> None:
     inp["grids"]["models"][0]["preprocessing"] = "very long pipeline description " * 40
     with pytest.raises(ppt.LayoutError):
         ppt.build_deck(inp, tmp_path / "overflow.pptx")
+
+
+# ---------------------------------------------------------------- new content slides
+def _table_rows(sl, name: str) -> list[list[str]]:
+    t = next(s for s in sl.shapes if s.name == name).table
+    return [[t.cell(r, c).text for c in range(len(t.columns))] for r in range(len(t.rows))]
+
+
+def test_preprocessing_slide_reports_treatments_from_eda(deck) -> None:
+    rows = {r[0]: r for r in _table_rows(slide(deck, "prep"), "table:preprocessing")[1:]}
+    assert rows["Missing values"][1] == "0"
+    assert rows["EDUCATION {0, 5, 6}"][1] == "345" and "4" in rows["EDUCATION {0, 5, 6}"][2]
+    assert rows["MARRIAGE {0}"][1] == "54"
+    assert rows["Negative bills (any month)"][1] == "1,930"
+    body = next(s for s in slide(deck, "prep").shapes if s.name == "body").text_frame.text
+    assert "no imputation" in body and "HTTP 422" in body
+
+
+def test_feature_catalogue_lists_every_group(deck) -> None:
+    sl = slide(deck, "features")
+    orig = _table_rows(sl, "table:features_original")
+    eng = _table_rows(sl, "table:features_engineered")
+    assert orig[0][0] == f"Original ({len(FEATURES)})" and len(orig) - 1 == len(RAW_FEATURE_GROUPS)
+    assert eng[0][0] == f"Engineered ({len(ENGINEERED)})" and len(eng) - 1 == len(FEATURE_GROUPS)
+    assert any("UTIL_1–6" in r[1] for r in eng) and any("PAY_1–6" in r[1] for r in orig)
+
+
+def test_selection_slide_shows_steps_and_both_importances(deck) -> None:
+    sl = slide(deck, "selection")
+    assert len(_table_rows(sl, "table:group_importance")) == 13  # header + top 12 groups
+    assert len(_table_rows(sl, "table:feature_importance")) == 13
+    body = next(s for s in sl.shapes if s.name == "body").text_frame.text
+    assert "IV ≥ 0.02" in body and "no pre-filter" in body
+    top_group = RAW_FEATURE_GROUPS[0][0]  # ranked first in the synthetic group importance
+    assert f"{top_group} matters most" in body
+
+
+def test_compact_series() -> None:
+    assert ppt._compact(["UTIL_1", "UTIL_2", "UTIL_3", "UTIL_MEAN"]) == "UTIL_1–3, UTIL_MEAN"
+    assert ppt._compact(["BILL_AMT1", "BILL_AMT2", "BILL_AMT3", "SEX"]) == "BILL_AMT1–3, SEX"
+    assert ppt._compact(["PAY_1", "PAY_3"]) == "PAY_1, PAY_3"  # not consecutive
+    assert ppt._compact(["SPEND_1", "SPEND_MEAN_3"]) == "SPEND_1, SPEND_MEAN_3"

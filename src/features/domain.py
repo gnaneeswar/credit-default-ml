@@ -116,6 +116,56 @@ ROLL_RATE = [
 ]
 ENGINEERED = [*ENGINEERED, *ACCOUNTING, *ROLL_RATE]
 
+# Feature catalogue for reports: (group, features, description). Covers ENGINEERED exactly
+# once (tested). Ratios are over LIMIT_BAL unless stated otherwise.
+FEATURE_GROUPS: list[tuple[str, list[str], str]] = [
+    ("Utilisation", [*UTIL, "UTIL_MEAN", "UTIL_MAX"], "BILL_AMT_n / LIMIT_BAL; 6-month mean, max"),
+    (
+        "Payment coverage",
+        [*PAY_COVER, "PAY_COVER_MEAN"],
+        "PAY_AMT_n / prior bill BILL_AMT_(n+1), clipped 0–5; mean",
+    ),
+    ("6-month trends", ["BILL_TREND", "PAY_AMT_TREND"], "Least-squares slope of bills / payments"),
+    (
+        "Status counts",
+        ["N_DELINQ", "MAX_DELINQ", "N_REVOLVING", "N_PAID_FULL", "N_INACTIVE", "N_BILL_NONPOS"],
+        "Months late, worst delay, revolving, paid in full, inactive, bill ≤ 0",
+    ),
+    (
+        "Credit balance",
+        ["HAS_CREDIT_BAL_1", "N_CREDIT_BAL", "MIN_CREDIT_BAL_RATIO"],
+        "Bill < 0 (overpayment / refund): latest flag, count, deepest credit",
+    ),
+    (
+        "Over limit",
+        ["OVER_LIMIT_1", "N_OVER_LIMIT", "MAX_OVER_LIMIT_EXCESS"],
+        "Bill > limit: latest flag, count, max excess",
+    ),
+    (
+        "Intra-cycle paydown",
+        ["PAYDOWN_1", "N_PAYDOWN", "MAX_PAYDOWN_EXCESS"],
+        "Paid > bill: latest flag, count, max excess",
+    ),
+    (
+        "Implied spend",
+        ["SPEND_1", "SPEND_MEAN_3", "SPEND_MEAN_5"],
+        "BILL_n − (BILL_(n+1) − PAY_AMT_n): latest, 3- and 5-month means",
+    ),
+    ("Cure", ["CURED_RECENT", "N_CURES"], "PAY_(n+1) ≥ 2 → PAY_n ≤ 0: latest flag, count"),
+    (
+        "Roll forward",
+        ["ROLL_FWD_RECENT", "N_ROLL_FWD", "MAX_ROLL_FWD_STEP", "N_DORMANT_TO_REVOLVER"],
+        "Worsening into delinquency (cur ≥ 1): flag, count, max step; −2 → 0 count",
+    ),
+    ("Roll backward", ["ROLL_BACK_RECENT", "N_ROLL_BACK"], "Improving while still past due"),
+    (
+        "Stagnation",
+        ["STAGNANT_RECENT", "N_STAGNANT", "MAX_DELINQ_STREAK"],
+        "Same status ≥ 2 month to month; longest run of PAY ≥ 2",
+    ),
+]
+FEATURE_TO_GROUP: dict[str, str] = {f: g for g, feats, _ in FEATURE_GROUPS for f in feats}
+
 # x-axis for 6-month trends in chronological order (Apr=0 … Sep=5), centred.
 _T = np.arange(6, dtype=float)
 _T_CENTRED = _T - _T.mean()

@@ -8,6 +8,7 @@ The 20% test set is used exactly once, here, after all tuning and threshold choi
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -66,6 +67,89 @@ def _confusion_png(cm: np.ndarray, threshold: float, path: Path) -> None:
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
+
+
+def feature_importance(model) -> pd.DataFrame:
+    """Per-feature importance of the champion from the fitted model itself (no extra cost):
+    impurity-based MDI for tree ensembles, |coefficient| for logistic regression.
+
+    MDI is computed on training data and favours continuous / correlated features, so it is
+    paired with the holdout *group* permutation importance below, which is the robust,
+    model-agnostic measure.
+    """
+    from src.data.schema import RAW_FEATURE_GROUPS
+    from src.features.domain import FEATURE_TO_GROUP
+
+    raw_group = {f: g for g, feats, _ in RAW_FEATURE_GROUPS for f in feats}
+    est = model[-1]
+    names = [str(c) for c in model[:-1].get_feature_names_out()]
+    if hasattr(est, "feature_importances_"):
+        native, native_type = np.asarray(est.feature_importances_), "impurity (MDI)"
+    else:
+        native, native_type = np.abs(np.ravel(est.coef_)), "|coefficient|"
+    base = [n.removeprefix("WOE_") for n in names]
+    out = pd.DataFrame(
+        {
+            "feature": names,
+            "origin": ["original" if b in raw_group else "engineered" for b in base],
+            "group": [raw_group.get(b) or FEATURE_TO_GROUP.get(b, "other") for b in base],
+            "importance": native,
+            "importance_type": native_type,
+        }
+    ).sort_values("importance", ascending=False, ignore_index=True)
+    out.insert(0, "rank", range(1, len(out) + 1))
+    return out
+
+
+def _group_drop(est, Xt: pd.DataFrame, y: np.ndarray, cols: list[str], seed: int) -> float:
+    from sklearn.metrics import roc_auc_score
+
+    rng = np.random.default_rng(seed)
+    Xp = Xt.copy()
+    Xp[cols] = Xp[cols].to_numpy()[rng.permutation(len(Xp))]  # one shared row permutation
+    return float(roc_auc_score(y, est.predict_proba(Xp)[:, 1]))
+
+
+def group_importance(
+    model, X: pd.DataFrame, y: np.ndarray, seed: int = 42, n_repeats: int = 3
+) -> pd.DataFrame:
+    """Permutation importance per feature *group*: all columns of a group are shuffled
+    together (same row permutation), so correlated siblings cannot stand in for each other.
+    Reported as the mean drop in holdout ROC-AUC."""
+    from joblib import Parallel, delayed
+    from sklearn.metrics import roc_auc_score
+
+    from src.data.schema import RAW_FEATURE_GROUPS
+    from src.features.domain import FEATURE_GROUPS
+
+    Xt = model[:-1].transform(X)
+    est = model[-1]
+    base = float(roc_auc_score(y, est.predict_proba(Xt)[:, 1]))
+    present = {str(c).removeprefix("WOE_"): str(c) for c in Xt.columns}
+    groups = []
+    for origin, catalogue in (("original", RAW_FEATURE_GROUPS), ("engineered", FEATURE_GROUPS)):
+        for name, feats, _ in catalogue:
+            cols = [present[f] for f in feats if f in present]
+            if cols:
+                groups.append((origin, name, cols))
+    jobs = [
+        delayed(_group_drop)(est, Xt, y, cols, seed + r)
+        for _, _, cols in groups
+        for r in range(n_repeats)
+    ]
+    scores = np.array(Parallel(n_jobs=-1)(jobs)).reshape(len(groups), n_repeats)
+    drops = base - scores
+    out = pd.DataFrame(
+        {
+            "group": [g for _, g, _ in groups],
+            "origin": [o for o, _, _ in groups],
+            "n_features": [len(c) for _, _, c in groups],
+            "auc_drop_mean": drops.mean(axis=1),
+            "auc_drop_std": drops.std(axis=1),
+        }
+    ).sort_values("auc_drop_mean", ascending=False, ignore_index=True)
+    out.insert(0, "rank", range(1, len(out) + 1))
+    return out
 
 
 def evaluate_champion(
@@ -135,6 +219,22 @@ def evaluate_champion(
         log_path_io(log, "write", path)
     else:
         log.warning("%s missing: skipping holdout decile table", train_deciles_path)
+
+    fi = feature_importance(model)
+    log_table(
+        log,
+        f"champion feature importance — {fi['importance_type'].iloc[0]} (top 15 of {len(fi)})",
+        fi.head(15).drop(columns=["importance_type"]),
+    )
+    fi_path = out / "feature_importance.csv"
+    fi.to_csv(fi_path, index=False, lineterminator="\n")
+    log_path_io(log, "write", fi_path)
+    t0 = time.perf_counter()
+    gi = group_importance(model, X_test[info.input_columns].astype("float64"), y, settings.seed)
+    log_table(log, f"group permutation importance on holdout ({time.perf_counter() - t0:.1f}s)", gi)
+    gi_path = out / "feature_group_importance.csv"
+    gi.to_csv(gi_path, index=False, lineterminator="\n")
+    log_path_io(log, "write", gi_path)
 
     files = {
         out / "test_metrics.json": json.dumps(metrics, indent=2) + "\n",

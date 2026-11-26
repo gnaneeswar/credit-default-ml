@@ -37,15 +37,22 @@ INPUTS = {
     "test": "test_metrics.json",
     "deciles": "train_decile_analysis.csv",
     "test_deciles": "test_decile_analysis.csv",
+    "importance": "feature_importance.csv",
+    "group_importance": "feature_group_importance.csv",
 }
 
-TITLES = [
-    "Credit Card Default Prediction — End-to-End ML & MLOps Pipeline",
-    "Important EDA Observations",
-    "Candidate Models & Cross-Validation Hyperparameters",
-    "Top 3 Models & Winning Hyperparameters",
-    "Training (OOF) vs. Test Results & Decile-Wise Performance",
-]
+T = {
+    "cover": "Credit Card Default Prediction — End-to-End ML & MLOps Pipeline",
+    "eda": "Important EDA Observations",
+    "prep": "Data Preprocessing & Missing-Value Treatment",
+    "features": "Feature Catalogue: Original & Engineered Features",
+    "selection": "Feature Selection & Champion Feature Importance",
+    "models": "Candidate Models & Cross-Validation Hyperparameters",
+    "top3": "Top 3 Models & Winning Hyperparameters",
+    "results": "Training (OOF) vs. Test Results & Decile-Wise Performance",
+}
+SLIDE_ORDER = ["cover", "eda", "prep", "features", "selection", "models", "top3", "results"]
+TITLES = [T[k] for k in SLIDE_ORDER]
 
 # ----------------------------------------------------------------------------- theme
 NAVY = RGBColor(0x1F, 0x2A, 0x44)
@@ -257,7 +264,7 @@ def _cover(prs, inp: dict) -> None:
     sh, tb = eda["shapes"], eda["target_balance"]
     champ = _champion(inp)
     _textbox(
-        slide, Box(0.9, 1.35, 11.5, 1.6), [TITLES[0]], COVER_TITLE_PT, WHITE, "title", bold=True
+        slide, Box(0.9, 1.35, 11.5, 1.6), [T["cover"]], COVER_TITLE_PT, WHITE, "title", bold=True
     )
     bar = slide.shapes.add_shape(
         MSO_SHAPE.RECTANGLE, Inches(0.9), Inches(3.05), Inches(1.6), Inches(0.07)
@@ -290,7 +297,7 @@ def _cover(prs, inp: dict) -> None:
 
 def _eda_slide(prs, inp: dict) -> None:
     slide = prs.slides.add_slide(prs.slide_layouts[6])
-    _title(slide, TITLES[1])
+    _title(slide, T["eda"])
     eda, iv = inp["eda"], inp["iv"]
     sh, tb = eda["shapes"], eda["target_balance"]
     edu = pd.DataFrame(eda["code_tables"]["EDUCATION"])
@@ -352,9 +359,236 @@ def _eda_slide(prs, inp: dict) -> None:
     )
 
 
+def _compact(names: list[str]) -> str:
+    """'UTIL_1'..'UTIL_6' -> 'UTIL_1–6'; other names unchanged, order preserved."""
+    import re
+
+    out, i = [], 0
+    while i < len(names):
+        m = re.fullmatch(r"(.*?)(\d+)", names[i])
+        j = i
+        if m:
+            while j + 1 < len(names):
+                n = re.fullmatch(r"(.*?)(\d+)", names[j + 1])
+                if not (
+                    n
+                    and n.group(1) == m.group(1)
+                    and int(n.group(2)) == int(m.group(2)) + (j + 1 - i)
+                ):
+                    break
+                j += 1
+        if m and j - i >= 2:
+            out.append(f"{names[i]}–{re.fullmatch(r'.*?(\d+)', names[j]).group(1)}")
+        else:
+            out.extend(names[i : j + 1])
+        i = j + 1
+    return ", ".join(out)
+
+
+def _prep_slide(prs, inp: dict) -> None:
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _title(slide, T["prep"])
+    eda = inp["eda"]
+    sh = eda["shapes"]
+    rows_n, cols_n = sh["full"][0], sh["full"][1] - 1
+    edu = pd.DataFrame(eda["code_tables"]["EDUCATION"])
+    mar = pd.DataFrame(eda["code_tables"]["MARRIAGE"])
+    pay = pd.DataFrame(eda["code_tables"]["PAY_1"]).set_index("PAY_1")["count"]
+    n_edu = int(edu.loc[edu["EDUCATION"].isin([0, 5, 6]), "count"].sum())
+    n_mar = int(mar.loc[mar["MARRIAGE"] == 0, "count"].sum())
+    min_limit = eda["numeric_distributions"]["LIMIT_BAL"]["min"]
+    split = f"{sh['train'][0]:,} / {sh['test'][0]:,}"
+    bullets = [
+        f"Validation on load: {cols_n} canonical features + target checked; ID dropped; "
+        "UCI X1..X23 / Y renamed (PAY_0 → PAY_1)",
+        f"Missing values: {eda['total_missing']} across all {rows_n:,} rows × {cols_n} "
+        "features → no imputation needed",
+        "Serving never imputes silently: null / NaN / non-numeric inputs get HTTP 422",
+        "Defensive fallback: WoE maps missing or unseen values to WoE 0 (neutral)",
+        "All inputs cast to float64; every fitted step lives inside the sklearn Pipeline "
+        "and is re-fitted per CV fold (leak-free)",
+        f"Stratified 80/20 split ({split}, random_state = 42); 3-fold StratifiedKFold "
+        "inside the training split",
+    ]
+    left_w = 5.3
+    _textbox(
+        slide, Box(MARGIN, TOP, left_w, BOTTOM - TOP), bullets, NOTE_PT, SLATE, "body", bullets=True
+    )
+    rows = [
+        ["Missing values", f"{eda['total_missing']}", "None required (complete data)"],
+        ["Duplicate feature rows", f"{eda['duplicate_rows']}", "Kept: distinct customer IDs"],
+        ["EDUCATION {0, 5, 6}", f"{n_edu:,}", "Remapped to 4 'others'"],
+        ["MARRIAGE {0}", f"{n_mar:,}", "Remapped to 3 'others'"],
+        [
+            "PAY_n codes −2 / 0 (PAY_1)",
+            f"{int(pay[-2]):,} / {int(pay[0]):,}",
+            "Kept as distinct ordinal codes",
+        ],
+        [
+            "Negative bills (any month)",
+            f"{eda['negative_bill_rows']:,}",
+            "Preserved: credit-balance signal",
+        ],
+        [
+            "Zero bill in all 6 months",
+            f"{eda['zero_bill_all_months_rows']:,}",
+            "Kept: inactive accounts",
+        ],
+        [
+            "Outliers / long tails",
+            "—",
+            "Not removed: trees are split-based; WoE bins cap extremes; coverage clipped ≤ 5",
+        ],
+        [
+            "Ratio denominators",
+            f"min LIMIT_BAL {min_limit:,.0f}",
+            "Divide by LIMIT_BAL only (≤ 0 → 0), never by a bill",
+        ],
+    ]
+    x = MARGIN + left_w + 0.4
+    _table(
+        slide,
+        Box(x, TOP, SLIDE_W - MARGIN - x, BOTTOM - TOP),
+        ["Step", "Rows affected", "Treatment"],
+        rows,
+        [2.2, 1.45, 2.983],
+        "table:preprocessing",
+        cell_pt=DECILE_PT,
+    )
+
+
+def _features_slide(prs, inp: dict) -> None:
+    from src.data.schema import FEATURES, RAW_FEATURE_GROUPS
+    from src.features.domain import ENGINEERED, FEATURE_GROUPS
+
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _title(slide, T["features"])
+    left_w = 4.3
+    _table(
+        slide,
+        Box(MARGIN, TOP, left_w, BOTTOM - TOP),
+        [f"Original ({len(FEATURES)})", "Columns", "Description"],
+        [[g, _compact(f), d] for g, f, d in RAW_FEATURE_GROUPS],
+        [1.15, 1.25, 1.9],
+        "table:features_original",
+        cell_pt=DECILE_PT,
+    )
+    x = MARGIN + left_w + 0.4
+    _table(
+        slide,
+        Box(x, TOP, SLIDE_W - MARGIN - x, BOTTOM - TOP),
+        [f"Engineered ({len(ENGINEERED)})", "Features", "Definition"],
+        [[g, _compact(f), d] for g, f, d in FEATURE_GROUPS],
+        [1.45, 3.1, 3.083],
+        "table:features_engineered",
+        cell_pt=DECILE_PT,
+        header_h=0.42,
+        row_min=0.33,
+    )
+
+
+def _selection_slide(prs, inp: dict) -> None:
+    from src.data.schema import FEATURES
+
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _title(slide, T["selection"])
+    iv, grids, fi, gi = inp["iv"], inp["grids"], inp["importance"], inp["group_importance"]
+    champ = _champion(inp)
+    sel = grids.get("selection", {})
+    iv_min = sel.get("iv_min", 0.02)
+    dropped = sorted(iv.loc[~iv["selected"], "feature"].tolist())  # sorted: series compact
+    champ_spec = next(m for m in grids["models"] if m["name"] == champ["name"])
+    best = json.loads(champ["cv"]["best_params"])
+    reg = {
+        **{
+            k: champ_spec["fixed_params"][k]
+            for k in ("max_features", "max_samples")
+            if k in champ_spec["fixed_params"]
+        },
+        **best,
+    }
+    top_group = gi.iloc[0]
+    bullets = [
+        f"Inputs: {len(iv)} model features = {len(FEATURES)} original + "
+        f"{len(iv) - len(FEATURES)} engineered "
+        "(stateless, nothing fitted)",
+        f"Logistic Regression: WoE/IV filter fitted inside each CV fold; IV ≥ {iv_min:g} keeps "
+        f"{len(iv) - len(dropped)}/{len(iv)}. Dropped: {_compact(dropped)}",
+        f"Trees ({champ['display']} champion): no pre-filter; splits select features, "
+        f"regularised by {_fmt_params(reg)}",
+        "Leak-free: selection re-fitted per training fold (tested); holdout used only for "
+        "final scoring and importance",
+        f"Importance: model MDI per feature; holdout permutation per group — "
+        f"{top_group['group']} matters most (ΔROC-AUC {top_group['auc_drop_mean']:.3f})",
+    ]
+    left_w, mid_w, gap = 4.4, 3.7, 0.3
+    _textbox(
+        slide, Box(MARGIN, TOP, left_w, BOTTOM - TOP), bullets, NOTE_PT, SLATE, "body", bullets=True
+    )
+    x_mid = MARGIN + left_w + gap
+    _textbox(
+        slide,
+        Box(x_mid, TOP, mid_w, 0.4),
+        ["Holdout group permutation (ΔAUC)"],
+        NOTE_PT,
+        NAVY,
+        "label:groups",
+        bold=True,
+    )
+    grows = [
+        [r.group, "orig." if r.origin == "original" else "eng.", f"{r.auc_drop_mean:.4f}"]
+        for r in gi.head(12).itertuples()
+    ]
+    _table(
+        slide,
+        Box(x_mid, TOP + 0.45, mid_w, BOTTOM - TOP - 0.45),
+        ["Feature group", "Type", "ΔROC-AUC"],
+        grows,
+        [2.05, 0.6, 1.05],
+        "table:group_importance",
+        cell_pt=DECILE_PT,
+        header_h=0.42,
+        row_min=0.33,
+        align_right_from=2,
+    )
+    x_r = x_mid + mid_w + gap
+    w_r = SLIDE_W - MARGIN - x_r
+    kind = fi["importance_type"].iloc[0]
+    _textbox(
+        slide,
+        Box(x_r, TOP, w_r, 0.4),
+        [f"Top 12 features — {'MDI' if 'MDI' in kind else '|coef|'}"],
+        NOTE_PT,
+        NAVY,
+        "label:features",
+        bold=True,
+    )
+    frows = [
+        [
+            str(r.rank),
+            r.feature,
+            "orig." if r.origin == "original" else "eng.",
+            f"{r.importance:.3f}",
+        ]
+        for r in fi.head(12).itertuples()
+    ]
+    _table(
+        slide,
+        Box(x_r, TOP + 0.45, w_r, BOTTOM - TOP - 0.45),
+        ["#", "Feature", "Type", "MDI" if "MDI" in kind else "|coef|"],
+        frows,
+        [0.4, 1.83, 0.55, w_r - 2.78],
+        "table:feature_importance",
+        cell_pt=DECILE_PT,
+        header_h=0.42,
+        row_min=0.33,
+        align_right_from=3,
+    )
+
+
 def _candidates_slide(prs, inp: dict) -> None:
     slide = prs.slides.add_slide(prs.slide_layouts[6])
-    _title(slide, TITLES[2])
+    _title(slide, T["models"])
     grids = inp["grids"]
     cv = grids["cv"]
     total = sum(m["n_candidates"] for m in grids["models"])
@@ -399,7 +633,7 @@ def _candidates_slide(prs, inp: dict) -> None:
 
 def _top3_slide(prs, inp: dict) -> None:
     slide = prs.slides.add_slide(prs.slide_layouts[6])
-    _title(slide, TITLES[3])
+    _title(slide, T["top3"])
     names = _display_names(inp["grids"])
     cv = inp["cv"].sort_values("cv_f1", ascending=False).reset_index(drop=True)
     top3 = cv.head(3)
@@ -475,7 +709,7 @@ def _results_slide(prs, inp: dict) -> None:
     """Top: Train (OOF) vs Holdout metrics strip. Bottom: train and holdout decile tables
     side by side; the holdout uses the *training* score bands, so rows line up."""
     slide = prs.slides.add_slide(prs.slide_layouts[6])
-    _title(slide, TITLES[4])
+    _title(slide, T["results"])
     oof, test = inp["oof"], inp["test"]["at_registered_threshold"]
     metrics = [
         ("Threshold", "threshold"),
@@ -543,8 +777,18 @@ def _results_slide(prs, inp: dict) -> None:
 def build_deck(inp: dict, out_path: Path) -> Path:
     prs = Presentation()
     prs.slide_width, prs.slide_height = Inches(SLIDE_W), Inches(SLIDE_H)
-    for builder in (_cover, _eda_slide, _candidates_slide, _top3_slide, _results_slide):
-        builder(prs, inp)
+    builders = {
+        "cover": _cover,
+        "eda": _eda_slide,
+        "prep": _prep_slide,
+        "features": _features_slide,
+        "selection": _selection_slide,
+        "models": _candidates_slide,
+        "top3": _top3_slide,
+        "results": _results_slide,
+    }
+    for key in SLIDE_ORDER:
+        builders[key](prs, inp)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     prs.save(str(out_path))
     log_path_io(log, "write", out_path)

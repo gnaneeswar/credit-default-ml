@@ -151,6 +151,11 @@ def stage_train(ctx: Context) -> None:
                 "n_jobs": -1,
                 "refit": False,
             },
+            "selection": {
+                "iv_min": s.iv_min,
+                "lr": "WoE/IV filter fitted inside each CV training fold",
+                "trees": "no pre-filter; implicit selection through splits",
+            },
             "models": [spec.describe(s, pos_weight) for spec in specs],
         },
         out / "train_oof_metrics.json": {
@@ -224,6 +229,8 @@ def stage_evaluate(ctx: Context) -> None:
             "test_confusion_matrix.json",
             "test_confusion_matrix.png",
             "test_decile_analysis.csv",
+            "feature_importance.csv",
+            "feature_group_importance.csv",
         ):
             if (s.artifacts_dir / name).exists():
                 mlflow.log_artifact(str(s.artifacts_dir / name), artifact_path="holdout")

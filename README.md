@@ -7,7 +7,7 @@ UCI *Default of Credit Card Clients* dataset (id 350, Taiwan 2005, 30,000 client
 with leak-free 3-fold CV, picks a decision threshold from out-of-fold deciles, and registers
 the winner as `models:/credit-default-pipeline@champion` in a SQLite MLflow registry. After
 that it evaluates the champion on a 20% holdout, runs Evidently drift monitoring, and
-generates a 5-slide interview deck (`artifacts/credit_default_summary.pptx`).
+generates an 8-slide interview deck (`artifacts/credit_default_summary.pptx`).
 `Dockerfile.serve` loads that champion into **FastAPI**. On a 12-core laptop (WSL2) the
 pipeline takes **34–45 s** and the training container about 40–50 s end to end.
 
@@ -292,6 +292,29 @@ has 1,922 roll-backs against 74–161 elsewhere, because code `1` effectively ex
   `N_DORMANT_TO_REVOLVER`, `HAS_CREDIT_BAL_1` and `MIN_CREDIT_BAL_RATIO` are dropped there.
   The tree models still use them.
 
+**What the champion relies on** (`artifacts/feature_group_importance.csv`). This is
+**group** permutation importance on the 6,000-row holdout: every column of a group is
+shuffled together, so correlated siblings can't stand in for each other.
+
+| Rank | Group | Origin | ΔROC-AUC when shuffled |
+|---|---|---|---|
+| 1 | Repayment status (`PAY_1..6`) | original | 0.016 |
+| 2 | Utilisation (`UTIL_*`) | engineered | 0.015 |
+| 3 | Bill amounts | original | 0.010 |
+| 4 | Payments | original | 0.009 |
+| 5 | Status counts | engineered | 0.009 |
+| 6 | Stagnation | engineered | 0.007 |
+| 7 | Roll forward | engineered | 0.004 |
+
+Single-feature permutation scores are tiny here (≤ 0.009), because 68 correlated inputs
+cover for each other. That is why groups are the honest unit of attribution. Per feature,
+the champion's own impurity importance (MDI) ranks `PAY_1` first, then `N_DELINQ`,
+`MAX_DELINQ`, and four new roll-rate features in the top 7 (`MAX_DELINQ_STREAK`,
+`N_STAGNANT`, `N_ROLL_FWD`, `MAX_ROLL_FWD_STEP`). MDI is computed on training data and
+favours continuous, correlated features, so it is reported *alongside* the holdout group
+view, not instead of it. Per-feature permutation on all 68 inputs was measured at 7–9 s,
+too slow for the 45 s budget.
+
 **Impact vs. the 45-feature baseline** (same splits, grids and seeds; `main` @ `bfc33f6`):
 
 | | Baseline (45 features) | Billing-cycle features (68) | Δ |
@@ -548,7 +571,8 @@ curl -s -X POST localhost:8000/invocations -H 'Content-Type: application/json' \
 | `artifacts/test_decile_analysis.csv` | holdout lift table on the **training** score bands, with band shares; `test_metrics.json` adds `score_psi_vs_train_bands` |
 | `artifacts/test_metrics.json`, `test_confusion_matrix.{json,png}` | holdout evaluation of `@champion` |
 | `artifacts/monitoring_report*.html`, `monitoring_summary.json` | Evidently reports and alert summary |
-| `artifacts/credit_default_summary.pptx` | **interview deck** (16:9, cover + 4 slides: EDA observations, candidate models and CV grids, top 3 models, and Train OOF vs Holdout metrics with both decile tables side by side), rebuilt from the artifacts on every run; `uv run python -m src.reporting.ppt` rebuilds it alone |
+| `artifacts/credit_default_summary.pptx` | **interview deck** (16:9, cover + 7 slides: EDA observations, data preprocessing and missing-value treatment, feature catalogue, feature selection and champion importance, candidate models and CV grids, top 3 models, Train OOF vs Holdout metrics with both decile tables), rebuilt from the artifacts on every run; `uv run python -m src.reporting.ppt` rebuilds it alone |
+| `artifacts/feature_importance.csv`, `feature_group_importance.csv` | champion importance: per feature from the model (impurity MDI for trees, \|coef\| for LR) and per feature group as holdout permutation ΔROC-AUC |
 | `artifacts/model_grids.json`, `train_oof_metrics.json` | deck inputs: model grids, imbalance handling and CV setup (generated from the model specs), and OOF metrics at the threshold |
 | `artifacts/batch_predictions.csv` | batch client output: actual vs predicted |
 | `mlruns/` | MLflow tracking database, model registry and artifacts |
@@ -559,7 +583,7 @@ To browse the runs (optional, read-only UI): `uvx mlflow ui --backend-store-uri 
 
 ```bash
 uv sync                                   # Python 3.12 venv from uv.lock
-uv run pytest -q                          # 109 offline tests
+uv run pytest -q                          # 115 offline tests
 uv run ruff check . && uv run ruff format --check .
 uv run python -m src.training.run         # all stages (or --stages / --models)
 uv run uvicorn src.inference.app:app --port 8000

@@ -279,3 +279,13 @@ def test_never_late_and_cured_differ() -> None:
     out = engineer(frame(status_row(0, 0, 0, 0, 0, 0), status_row(0, 0, 0, 2, 2, 0)))
     assert out.loc[0, "PAY_1"] == out.loc[1, "PAY_1"] == 0
     assert out.loc[0, "N_CURES"] == 0 and out.loc[1, "N_CURES"] == 1
+
+
+def test_feature_catalogues_cover_every_feature_exactly_once() -> None:
+    from src.data.schema import RAW_FEATURE_GROUPS
+    from src.features.domain import FEATURE_GROUPS
+
+    raw = [f for _, feats, _ in RAW_FEATURE_GROUPS for f in feats]
+    eng = [f for _, feats, _ in FEATURE_GROUPS for f in feats]
+    assert sorted(raw) == sorted(FEATURES) and len(raw) == len(set(raw))
+    assert sorted(eng) == sorted(ENGINEERED) and len(eng) == len(set(eng))
