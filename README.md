@@ -6,9 +6,10 @@ UCI *Default of Credit Card Clients* dataset (id 350, Taiwan 2005, 30,000 client
 `Dockerfile.train` ingests the data and builds the EDA. It then tunes four model families
 with leak-free 3-fold CV, picks a decision threshold from out-of-fold deciles, and registers
 the winner as `models:/credit-default-pipeline@champion` in a SQLite MLflow registry. After
-that it evaluates the champion on a 20% holdout and runs Evidently drift monitoring.
+that it evaluates the champion on a 20% holdout, runs Evidently drift monitoring, and
+generates a 5-slide interview deck (`artifacts/credit_default_summary.pptx`).
 `Dockerfile.serve` loads that champion into **FastAPI**. On a 12-core laptop (WSL2) the
-pipeline takes **41–45 s** and the training container about 50 s end to end.
+pipeline takes **34–45 s** and the training container about 40–50 s end to end.
 
 ```bash
 git clone https://github.com/gnaneeswar/credit-default-ml.git && cd credit-default-ml
@@ -53,9 +54,58 @@ reward a model that flags nobody, so the pipeline **selects on F1**. It reports 
 PR-AUC, precision and recall alongside, and makes the cut-off an **explicit, registered
 decision** instead of a hidden 0.5.
 
-The data dictionary ([data/data_dictionary.md](data/data_dictionary.md)) maps the raw
-`X1..X23` / `Y` columns to their domain names. Position 1 is the most recent month:
-`PAY_0` / `BILL_AMT1` / `PAY_AMT1` are all September 2005. The data has no `PAY_1` column.
+### Data dictionary summary
+
+The full dictionary is [data/data_dictionary.md](data/data_dictionary.md). It maps the raw
+`X1..X23` / `Y` columns to their domain names.
+
+**Standardised naming.** UCI names September's repayment status `PAY_0`, while bills and
+payments use `BILL_AMT1` / `PAY_AMT1`. On load, `PAY_0` is **renamed to `PAY_1`**, so all
+three monthly families share 1–6 indexing. This is a **breaking API change** from earlier
+versions: requests must send `PAY_1`. A payload still using `PAY_0` gets a 422 listing
+`missing_columns: ["PAY_1"]` and `unknown_columns: ["PAY_0"]`.
+
+| n | Month (2005) | Columns |
+|---|---|---|
+| 1 | September (most recent) | `PAY_1`, `BILL_AMT1`, `PAY_AMT1` |
+| 2 | August | `PAY_2`, `BILL_AMT2`, `PAY_AMT2` |
+| 3–5 | July – May | `PAY_3..5`, `BILL_AMT3..5`, `PAY_AMT3..5` |
+| 6 | April (oldest) | `PAY_6`, `BILL_AMT6`, `PAY_AMT6` |
+
+The target `default_payment_next_month` refers to **October 2005**.
+
+**Billing-cycle mechanics** (the project's domain definition):
+- Statements run on rolling cycles and are named after the month they **close** in.
+  Example: a 16th→15th cycle, with payment due on the 5th of the following month.
+- **`BILL_AMT_n`** is the balance on month *n*'s closing date: previous unpaid balance +
+  purchases + interest/fees − payments posted before the close.
+- **`PAY_AMT_n`** is the cash received in **calendar** month *n*. A Sept 4 payment is
+  deducted from `BILL_AMT1`. A Sept 22 payment counts in `PAY_AMT1` but carries over to
+  October's statement.
+- **`PAY_n`** is a snapshot on month *n*'s close of how the *previous* statement was
+  handled by its due date:
+  - `-2` inactive cycle
+  - `-1` paid in full
+  - `0` revolving / minimum met
+  - `1..9` the number of consecutive missed due dates
+
+  It counts missed due dates, not billing cycles. Under this rule, `PAY_1` = 1 means the
+  Sept 5 due date (for the August bill) was missed.
+
+**Empirical check.** The EDA tests these rules against the data (`domain_rule_checks` in
+[artifacts/eda_report.md](artifacts/eda_report.md)). Most hold: the risk ordering of every
+behavioural segment matches the domain logic (§4.2). Three do not match exactly:
+- **Timing.** A "paid in full" status in month *k* is confirmed by statement *k* being
+  covered by the *following* month's payment in **98–99%** of rows. The §4 pairing
+  ("previous statement paid in month *k*") explains only 73–80%. So the data aligns status
+  codes about one month later than the rule.
+- **Inactive codes.** "`-2` ⇒ `BILL_AMT_n ≤ 0`" holds for only 33–71% of `-2` rows.
+- **Code `1` is month-specific.** It appears 3,688 times in `PAY_1` but only 28/4/2/0/0
+  times in `PAY_2..PAY_6`, so the source coded the latest month differently.
+
+None of these change the engineered features, which use the status sequence and the
+per-month amounts directly. They are documented rather than silently "fixed"; see
+[§4.1](#41-undocumented-category-codes-and-domain-rules).
 
 ## 2. Results at a glance
 
@@ -63,12 +113,12 @@ The data dictionary ([data/data_dictionary.md](data/data_dictionary.md)) maps th
 
 | Model | CV F1 | ± std | ROC-AUC | PR-AUC | Precision | Recall |
 |---|---|---|---|---|---|---|
-| **Random Forest** ✅ champion | **0.546** | 0.007 | 0.785 | 0.552 | 0.514 | 0.583 |
-| LightGBM | 0.544 | 0.007 | 0.784 | 0.559 | 0.479 | 0.629 |
-| XGBoost | 0.542 | 0.006 | 0.785 | 0.559 | 0.476 | 0.629 |
-| Logistic Regression (WoE/IV) | 0.535 | 0.010 | 0.778 | 0.535 | 0.464 | 0.630 |
+| **Random Forest** ✅ champion | **0.549** | 0.004 | 0.787 | 0.558 | 0.524 | 0.577 |
+| XGBoost | 0.545 | 0.008 | 0.789 | 0.561 | 0.468 | 0.653 |
+| LightGBM | 0.543 | 0.007 | 0.785 | 0.559 | 0.481 | 0.625 |
+| Logistic Regression (WoE/IV) | 0.535 | 0.009 | 0.780 | 0.540 | 0.465 | 0.631 |
 
-**Decision threshold:** 0.475, which means flagging the riskiest 27% of clients. It was
+**Decision threshold:** 0.478, which means flagging the riskiest 26% of clients. It was
 picked from out-of-fold predictions; [§4.4](#44-model-selection-cv-and-threshold-tuning)
 explains how.
 
@@ -76,22 +126,23 @@ explains how.
 
 | Cutoff | F1 | Precision | Recall | Accuracy | ROC-AUC | PR-AUC | Flagged |
 |---|---|---|---|---|---|---|---|
-| registered 0.475 | 0.538 | 0.485 | 0.604 | 0.770 | 0.777 | 0.553 | 27.6% |
-| default 0.5 (reference) | 0.541 | 0.505 | 0.583 | 0.781 | 0.777 | 0.553 | 25.5% |
+| registered 0.478 | 0.547 | 0.505 | 0.596 | 0.782 | 0.780 | 0.558 | 26.1% |
+| default 0.5 (reference) | 0.549 | 0.524 | 0.576 | 0.791 | 0.780 | 0.558 | 24.3% |
 
-Confusion at 0.475: the model catches **802 of 1,327 defaults** and flags 853 good clients
-(TN 3,820 · FP 853 · FN 525 · TP 802).
+Confusion at 0.478: the model catches **791 of 1,327 defaults** and flags 775 good clients
+(TN 3,898 · FP 775 · FN 536 · TP 791). The train (OOF) F1 was 0.549 and holdout F1 is
+0.547, so the cutoff generalises.
 
-**Lift:** the riskiest 10% of clients default at 3.1× the base rate. The top 30% contain
+**Lift:** the riskiest 10% of clients default at 3.2× the base rate. The top 30% contain
 64% of all defaults.
 
 **Monitoring** (Evidently, compared against the out-of-fold training baseline):
 
 | Batch | Drifted features | F1 (Δ) | Alerts |
 |---|---|---|---|
-| holdout | 0 / 23 | 0.538 (−0.008) | none |
-| simulated downturn (limits −40%, statuses +1 month, bills +40%) | 13 / 23 | 0.399 (−0.147) | data drift + performance |
-| concept drift (30% of labels flipped) | 0 / 23 | 0.404 (−0.142) | performance only |
+| holdout | 0 / 23 | 0.547 (−0.002) | none |
+| simulated downturn (limits −40%, statuses `PAY_1..6` +1 month, bills +40%) | 13 / 23 | 0.450 (−0.098) | data drift + performance |
+| concept drift (30% of labels flipped) | 0 / 23 | 0.397 (−0.152) | performance only |
 
 ## 3. Architecture
 
@@ -103,7 +154,7 @@ Confusion at 0.475: the model catches **802 of 1,327 defaults** and flags 853 go
                                         │ writes                        │ writes
                                         ▼                               ▼
                     ./mlruns  (sqlite:///mlruns/mlflow.db +     ./artifacts (EDA, IV, deciles,
-                               model artifacts, skops)           metrics, confusion, monitoring)
+                               model artifacts, skops)           metrics, monitoring, .pptx deck)
                                         │ reads @champion + threshold tag
                          ┌──────────────▼─────────── Dockerfile.serve ──────────┐
    client ─ POST ──────▶ │ FastAPI + Uvicorn :8000   GET /health                │
@@ -120,14 +171,15 @@ Confusion at 0.475: the model catches **802 of 1,327 defaults** and flags 853 go
 | `src/training` | model specs/grids, tuning, OOF threshold, registry, holdout eval, orchestrator | train |
 | `src/inference` | FastAPI app, request schemas, batch client — **no imports from training/data** | train + serve |
 | `src/monitoring` | Evidently scenarios, reports, alerts | train |
+| `src/reporting` | interview deck built from `artifacts/` (python-pptx) | train |
 
-The pipeline's stages are `ingest → eda → train → evaluate → monitor`. Running
+The pipeline's stages are `ingest → eda → train → evaluate → monitor → report`. Running
 `python -m src.training.run` runs them all by default; `--stages`/`--models` select a subset.
 The training run prints a stage-timing table at the end.
 
 ## 4. Design Decisions & Trade-offs
 
-### 4.1 Undocumented category codes
+### 4.1 Undocumented category codes and domain rules
 
 The EDA ([artifacts/eda_report.md](artifacts/eda_report.md), generated) checks every code
 that appears in the data but not in the UCI documentation:
@@ -138,17 +190,38 @@ that appears in the data but not in the UCI documentation:
 | `MARRIAGE` | 0 | 54 (0.2%) | default rate 9.3% vs 26% for code 3 | **remap to 3** on meaning (unknown ≈ "others"). The rates do *not* match; 54 rows are too few for a reliable level of their own |
 | `PAY_n` | −2, 0 | most common codes | `0` revolving (12.8%) and `−2` no consumption (13.2%) default **less** than `−1` paid in full (16.8%) | **keep as distinct codes**: collapsing them into −1 would lose real signal |
 
-The `PAY_n` meanings come from the project's domain definitions: −2 = card not used, −1 =
-paid in full, 0 = minimum paid with a balance carried. The EDA checks these against the
-same-month bill. `0` and `−1` match. `−2` does *not* imply a zero bill: in 75% of `PAY_0 =
-−2` rows a balance, fees or a credit still appears. So "inactive by status" (`N_INACTIVE`)
-and "nothing billed" (`N_BILL_NONPOS`) are **separate features**, and neither is derived
-from the other.
+**`PAY_n` codes are fed to the models as ordinal numbers** (−2 < −1 < 0 < 1 …), not one-hot
+encoded. Their risk is **not monotone** at the low end (−1 is riskier than 0 and −2), so
+each model family handles that its own way:
+- the trees split on the code several times;
+- LR's WoE gives every code its own bin, so it learns a non-monotone mapping;
+- the roll-rate features (§4.2) read each code as its own state.
+
+One-hot or LightGBM-native categorical encodings were not compared.
+
+The `PAY_n` meanings follow the project's billing-cycle definition
+(see [§1](#data-dictionary-summary)). The EDA checks them against the data:
+- **`0` and `−1` match.** Revolving accounts carry large balances; paid-in-full accounts
+  carry small ones.
+- **`−2` does *not* imply a zero bill.** In 67% of `PAY_1 = −2` rows a balance, fees or a
+  credit still appears. So "inactive by status" (`N_INACTIVE`) and "nothing billed"
+  (`N_BILL_NONPOS`) are **separate features**, and neither is derived from the other.
+- **Timing.** A "paid in full" status is confirmed by the *following* month's payment in
+  98–99% of rows, against 73–80% for the rule's own pairing.
+- **`PAY_1` caveat.** Under the rule, `PAY_1` (judged on Sept 15 against the Sept 5 due
+  date) holds no October information. Under the data's alignment, it may partly reflect
+  October payments. An ablation that neutralises `PAY_1` costs about 0.04 CV F1. The model
+  keeps it (as in the original paper), but in production it should be used only if the
+  September status is known before the October decision.
 
 ### 4.2 Domain feature engineering
 
-`DomainFeatureEngineer` is **stateless**: it learns nothing from the data, so it cannot
-leak. It adds 22 features to the 23 raw ones:
+`DomainFeatureEngineer` is **stateless and vectorised**: it learns nothing from the data,
+so it cannot leak, and it takes about 50 ms on 24,000 rows. It adds **45 features** to the
+23 raw ones (68 in total). Every ratio is divided by `LIMIT_BAL`, never by a bill, and all
+68 columns are tested finite for zero or negative bills, a zero limit and huge payments.
+
+**Core features (22):**
 
 * **Utilisation** `UTIL_n = BILL_AMTn / LIMIT_BAL`, plus its mean and max: how stretched the client is.
 * **Payment coverage** `PAY_COVER_n = PAY_AMTn / BILL_AMT(n+1)`: the payment made in month *n*
@@ -157,9 +230,67 @@ leak. It adds 22 features to the 23 raw ones:
 * **Behaviour counts**: months delinquent (`PAY_n > 0`), worst delay, months revolving,
   months paid in full, months with no consumption, months with a bill ≤ 0.
 
-IV confirms the engineered ratios add signal the raw amounts lack. Raw `BILL_AMT1–5` have
-IV 0.013–0.016 and are dropped (`BILL_AMT6` scrapes in at 0.023). `UTIL_*` reach 0.08–0.13.
-`PAY_COVER_1` (0.24) beats raw `PAY_AMT1` (0.18).
+**Billing-cycle accounting (12).** These are 6-month aggregates plus a flag for the most
+recent month. Per-month copies of every signal would have added about 70 sparse,
+near-duplicate columns.
+
+| Signal | Features | Logic | Default rate (any month) |
+|---|---|---|---|
+| Credit balance (low risk) | `HAS_CREDIT_BAL_1`, `N_CREDIT_BAL`, `MIN_CREDIT_BAL_RATIO` | `BILL_AMT_n < 0`; negative bills are never clipped | 16.5% |
+| Over limit (distress) | `OVER_LIMIT_1`, `N_OVER_LIMIT`, `MAX_OVER_LIMIT_EXCESS` | `BILL_AMT_n > LIMIT_BAL`; excess = `max(BILL − LIMIT, 0) / LIMIT` | 30.1% |
+| Intra-cycle paydown (liquidity) | `PAYDOWN_1`, `N_PAYDOWN`, `MAX_PAYDOWN_EXCESS` | `PAY_AMT_n > BILL_AMT_n`; excess = `max(PAY − BILL, 0) / LIMIT` | 15.7% |
+| Implied spend | `SPEND_1`, `SPEND_MEAN_3`, `SPEND_MEAN_5` | `BILL_AMT_n − (BILL_AMT_(n+1) − PAY_AMT_n)`, divided by `LIMIT`; 3- and 5-month rolling means smooth calendar-month vs. statement-cutoff timing | — |
+
+**Roll-rate trajectory (11).** These cover the 5 transitions `PAY_6 → … → PAY_1`.
+`*_RECENT` means the latest transition, `PAY_2 → PAY_1`. Single-month snapshots treat a
+never-late account (`0,0,0`) like a recently cured one (`2,2,0`). These features separate
+them.
+
+| Signal | Features | Logic | Default rate (any) |
+|---|---|---|---|
+| Cure | `CURED_RECENT`, `N_CURES` | prev ≥ 2 and cur ≤ 0 | 26.9% (cured, now current) vs **11.7%** never late |
+| Roll forward (worsening) | `ROLL_FWD_RECENT`, `N_ROLL_FWD`, `MAX_ROLL_FWD_STEP` | cur > prev **and cur ≥ 1**; step = cur − max(prev, 0) | 42.0% |
+| Dormant → revolver | `N_DORMANT_TO_REVOLVER` | prev = −2 and cur = 0 | 18.2% |
+| Roll backward (improving, still late) | `ROLL_BACK_RECENT`, `N_ROLL_BACK` | cur < prev, both > 0 | 47.3% |
+| Stagnation (chronic delay) | `STAGNANT_RECENT`, `N_STAGNANT`, `MAX_DELINQ_STREAK` | cur = prev ≥ 2; longest run of `PAY ≥ 2` | 57.0% |
+
+**Two deliberate deviations from the literal roll-forward rule** (`PAY_n > PAY_(n+1)`):
+1. **Roll-forward requires `cur ≥ 1`.** Moves among the non-delinquent codes are not
+   "worsening into delinquency". `−2 → 0` (dormant → revolver) is its own signal instead.
+   Its 18.2% default rate sits between never-late-and-never-dormant (11.1%) and roll-forward
+   (42.0%), so it would have diluted both.
+2. **The step is measured from `max(prev, 0)`.** So `−2 → 2` counts as 2 missed due dates,
+   not 4.
+
+There is no recent flag for dormant → revolver, because `PAY_2 = −2 → PAY_1 = 0` occurs in
+**0** of 30,000 rows. The latest transition also behaves differently from earlier ones: it
+has 1,922 roll-backs against 74–161 elsewhere, because code `1` effectively exists only in
+`PAY_1`. The `*_RECENT` flags isolate it.
+
+**What IV says.**
+- **Raw bills vs engineered ratios.** Raw `BILL_AMT1–5` have IV 0.013–0.016 and are dropped.
+  `UTIL_*` reach 0.08–0.12, and `PAY_COVER_1` (0.24) beats raw `PAY_AMT1` (0.18).
+- **The new trajectory features are among the strongest.** Five of the top 12: 
+  `MAX_DELINQ_STREAK` 0.85, `N_STAGNANT` 0.57, `N_ROLL_FWD` 0.48, `MAX_ROLL_FWD_STEP` 0.48,
+  `STAGNANT_RECENT` 0.38.
+- **Sparse flags fall below 0.02 for LR.** `OVER_LIMIT_1`, `N_CREDIT_BAL`, `CURED_RECENT`,
+  `N_DORMANT_TO_REVOLVER`, `HAS_CREDIT_BAL_1` and `MIN_CREDIT_BAL_RATIO` are dropped there.
+  The tree models still use them.
+
+**Impact vs. the 45-feature baseline** (same splits, grids and seeds; `main` @ `bfc33f6`):
+
+| | Baseline (45 features) | Billing-cycle features (68) | Δ |
+|---|---|---|---|
+| RF CV F1 (champion) | 0.5460 ± 0.0065 | **0.5493 ± 0.0042** | +0.003 |
+| XGBoost / LightGBM / LR CV F1 | 0.5420 / 0.5438 / 0.5346 | 0.5447 / 0.5434 / 0.5354 | +0.003 / −0.000 / +0.001 |
+| Holdout F1 @ registered cutoff | 0.5379 | **0.5468** | +0.009 |
+| Holdout precision / recall | 0.485 / 0.604 | 0.505 / 0.596 | +0.021 / −0.008 |
+| Holdout ROC-AUC / PR-AUC | 0.777 / 0.553 | 0.780 / 0.558 | +0.003 / +0.005 |
+| Pipeline runtime | 41–45 s | 34–41 s | unchanged (noise) |
+
+The gain is **consistent but modest**. Three of four families improve in CV, and the
+holdout improves on every ranking metric. On its own, +0.009 F1 is still within the
+holdout's sampling error (about ±0.015).
 
 ### 4.3 Leak-free WoE/IV for Logistic Regression; raw features for trees
 
@@ -167,7 +298,7 @@ IV 0.013–0.016 and are dropped (`BILL_AMT6` scrapes in at 0.023). `UTIL_*` rea
   - **Binning:** `WoEIVSelector` gives each code column one bin per value and splits other
     columns into ≤10 quantile bins. Bins under 1% of rows are merged with a neighbour.
   - **Encoding and selection:** it computes Laplace-smoothed WoE and IV, and drops features
-    with **IV < 0.02** (7 of 45: `BILL_AMT1–5`, `SEX`, `MARRIAGE`).
+    with **IV < 0.02** (13 of 68: `BILL_AMT1–5`, `SEX`, `MARRIAGE` and six sparse flags).
   - **Why LR needs it:** WoE puts every feature on a log-odds scale and makes its effect
     roughly linear, which is what a linear model needs. It also caps the influence of
     outliers.
@@ -178,7 +309,7 @@ IV 0.013–0.016 and are dropped (`BILL_AMT6` scrapes in at 0.023). `UTIL_*` rea
   - Flipping the held-out labels leaves their encoding unchanged.
   - A shuffled target yields IV ≈ 0.
 * **Trees get unbinned features.** RF, LightGBM and XGBoost find their own split points and
-  interactions; WoE binning would only throw resolution away. They see all 45 features.
+  interactions; WoE binning would only throw resolution away. They see all 68 features.
 * **`SEX` (fairness trade-off, deliberate):** IV removes `SEX` from LR (IV 0.011), but the
   tree models still receive it, and the champion is a tree model. This was a conscious
   choice for the assignment: its signal is weak and the model would barely change without
@@ -199,26 +330,26 @@ IV 0.013–0.016 and are dropped (`BILL_AMT6` scrapes in at 0.023). `UTIL_*` rea
   cutoff, so each model is weighted towards the minority class (`class_weight`,
   `is_unbalance`, `scale_pos_weight`). This shifts its probabilities so that 0.5 is a
   sensible cutoff, which makes F1 a fair way to compare candidates. The LR grid shows the
-  effect directly. Weighted and unweighted LR rank clients equally well (**ROC-AUC 0.777
+  effect directly. Weighted and unweighted LR rank clients equally well (**ROC-AUC 0.780
   for both**). Without weights, F1 at 0.5 collapses to **0.47** (recall 0.36) instead of
   **0.535**. The trade-off is that weighted models are not calibrated probabilities. That
   is acceptable here because decisions use a tuned cutoff, not the raw scores.
-* **Winner:** RF, by CV F1 (0.546). The top three are within about one standard deviation
-  of each other (±0.007), so in practice they are tied, and RF wins on the stated
-  criterion. LightGBM has the best PR-AUC.
+* **Winner:** RF (`max_depth=12, min_samples_leaf=10`), by CV F1 (0.549). The top three are
+  within 0.006 F1 of each other (about 1.4× the champion's fold std), so they are close to
+  tied, and RF wins on the stated criterion. XGBoost has the best ROC-AUC and PR-AUC.
 * **Threshold: coarse-to-fine, decile-based.**
   1. The OOF decile table ([artifacts/train_decile_analysis.csv](artifacts/train_decile_analysis.csv))
      shows bad rate, lift, cumulative capture, and the F1 you would get from flagging the
      top *k* deciles. The best is *k* = 3.
   2. Percentile cutoffs (1% steps) are then searched only inside deciles 2–4. Result:
-     **flag the riskiest 27%, cutoff 0.475** (OOF F1 0.546).
+     **flag the riskiest 26%, cutoff 0.478** (OOF F1 0.549).
 
-  Every cutoff therefore reads as a credit policy ("review the riskiest 27%"). Deciles
+  Every cutoff therefore reads as a credit policy ("review the riskiest 26%"). Deciles
   alone move 10% of clients at a time, too coarse to find the best F1. An unconstrained
   search could chase noise.
 * **Honest caveat:** the F1 curve is **flat** between about 0.47 and 0.52. On the OOF data,
-  the default 0.5 gives the same F1 (0.5459) as the chosen cutoff. On the holdout, 0.5
-  scores 0.541 against 0.538 for the registered cutoff, and the order flipped between
+  the default 0.5 gives F1 0.5493 against 0.5488 for the chosen cutoff. On the holdout, 0.5
+  scores 0.549 against 0.547 for the registered cutoff, and the order flipped between
   development runs. Differences of ±0.003 sit well inside the CV standard deviation (0.007)
   and the holdout's sampling error (about ±0.015 with 1,327 defaults). I did **not** retune
   on the test set, which would leak it into the model. On a flat plateau the cutoff mostly
@@ -261,8 +392,9 @@ IV 0.013–0.016 and are dropped (`BILL_AMT6` scrapes in at 0.023). `UTIL_*` rea
   `ClassificationPreset` at the registered threshold. Alerts fire when ≥ 25% of features
   drift, or when F1 or accuracy drops > 0.05.
   - The downturn simulation is caught by drift detection: exactly the 13 shifted columns
-    are flagged, and the untouched `PAY_AMT*` are not.
-  - Concept drift shows **no feature drift at all**, but F1 drops 0.14. Drift detection
+    (`LIMIT_BAL`, `PAY_1..PAY_6`, `BILL_AMT1..6`) are flagged, and the untouched `PAY_AMT*`
+    are not.
+  - Concept drift shows **no feature drift at all**, but F1 drops 0.15. Drift detection
     alone would miss it, which is why label-based performance monitoring is needed as well.
 
 ### 4.6 Engineering choices worth knowing
@@ -274,7 +406,9 @@ IV 0.013–0.016 and are dropped (`BILL_AMT6` scrapes in at 0.023). `UTIL_*` rea
 | float64 model signature | robust to clients sending `20000.0`; avoids MLflow's integer-schema pitfalls |
 | offline-first data | the CSV and dictionary are committed; `ucimlrepo` runs only on a cache miss or `--refresh` |
 | `pathlib` only, LF only | enforced by ruff `PTH` rules and `.gitattributes` / `.editorconfig` |
-| pipeline 41–45 s (was 55–60 s) | MLflow start-up overlaps the searches in a background thread; `refit=False` searches plus one parallel batch for the winner's refit and OOF folds; Evidently workers pre-warmed while registration runs. Results are bit-identical to the naive version. Container start-up and exit add about 5 s |
+| pipeline 34–45 s (was 55–60 s) | MLflow start-up overlaps the searches in a background thread; `refit=False` searches plus one parallel batch for the winner's refit and OOF folds; Evidently workers pre-warmed while registration runs. Results are bit-identical to the naive version. Container start-up and exit add about 5 s |
+| `PAY_0` → `PAY_1` | consistent 1–6 indexing across all three monthly families; the UCI name is recorded in `schema.UCI_ORIGINAL_NAMES` and the dictionary |
+| deck from artifacts only | every slide number is read from `artifacts/*.json` / `*.csv`; the build checks text fit and raises `LayoutError` instead of overflowing |
 | non-root containers | `USER 1000:1000`; `HOME`, `USER` and `LOGNAME` are set so MLflow works for any `-u` UID |
 
 ## 5. Prerequisites
@@ -344,13 +478,13 @@ to load it.
 ```bash
 curl -s localhost:8000/health
 # {"status":"ok","model_loaded":true,"model_name":"credit-default-pipeline","model_alias":"champion",
-#  "model_version":"1","model_family":"bagged trees","threshold":0.475159,"n_features":23,"error":null}
+#  "model_version":"1","model_family":"bagged trees","threshold":0.478358,"n_features":23,"error":null}
 
 curl -s -X POST localhost:8000/invocations \
      -H 'Content-Type: application/json' -d @sample_request.json
-# {"predictions":[{"default_probability":0.91,"prediction":1},
-#                 {"default_probability":0.33,"prediction":0},
-#                 {"default_probability":0.09,"prediction":0}], "threshold":0.475159, ...}
+# {"predictions":[{"default_probability":0.94,"prediction":1},
+#                 {"default_probability":0.32,"prediction":0},
+#                 {"default_probability":0.09,"prediction":0}], "threshold":0.478358, ...}
 ```
 
 [`sample_request.json`](sample_request.json) holds three real holdout clients: a delinquent
@@ -382,6 +516,9 @@ Invalid input is rejected with a precise 422:
 curl -s -X POST localhost:8000/invocations -H 'Content-Type: application/json' \
      -d '{"dataframe_split":{"columns":["LIMIT_BAL"],"data":[[20000]]}}'
 # {"detail":{"error":"columns do not match the model signature","missing_columns":["SEX", ...], ...}}
+
+# A pre-rename client still sending PAY_0 is told exactly what changed:
+#   "missing_columns": ["PAY_1"], "unknown_columns": ["PAY_0"]   (HTTP 422)
 ```
 
 ## 8. Outputs
@@ -395,6 +532,8 @@ curl -s -X POST localhost:8000/invocations -H 'Content-Type: application/json' \
 | `artifacts/train_decile_analysis.csv` | OOF decile lift, bad rate, capture and F1-at-cutoff table |
 | `artifacts/test_metrics.json`, `test_confusion_matrix.{json,png}` | holdout evaluation of `@champion` |
 | `artifacts/monitoring_report*.html`, `monitoring_summary.json` | Evidently reports and alert summary |
+| `artifacts/credit_default_summary.pptx` | **interview deck** (16:9, cover + 4 slides: EDA observations, candidate models and CV grids, top 3 models, OOF vs test and deciles), rebuilt from the artifacts on every run; `uv run python -m src.reporting.ppt` rebuilds it alone |
+| `artifacts/model_grids.json`, `train_oof_metrics.json` | deck inputs: model grids, imbalance handling and CV setup (generated from the model specs), and OOF metrics at the threshold |
 | `artifacts/batch_predictions.csv` | batch client output: actual vs predicted |
 | `mlruns/` | MLflow tracking database, model registry and artifacts |
 
@@ -404,7 +543,7 @@ To browse the runs (optional, read-only UI): `uvx mlflow ui --backend-store-uri 
 
 ```bash
 uv sync                                   # Python 3.12 venv from uv.lock
-uv run pytest -q                          # 85 offline tests
+uv run pytest -q                          # 106 offline tests
 uv run ruff check . && uv run ruff format --check .
 uv run python -m src.training.run         # all stages (or --stages / --models)
 uv run uvicorn src.inference.app:app --port 8000
@@ -423,6 +562,10 @@ The test suite covers:
 - the batch client
 - import boundaries
 - Evidently parsing and alerts
+- billing-cycle features (the brief's worked examples, trajectories, finiteness)
+- EDA domain-rule checks
+- the deck (slide count and titles, populated tables, in-bounds and non-overlapping shapes,
+  font minimums, fills, data-driven numbers, overflow errors)
 
 ## 10. Cleanup
 

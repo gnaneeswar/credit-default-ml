@@ -84,7 +84,7 @@ def test_drift_detects_shift_but_not_same_distribution(frames, fitted) -> None:
     s_shift = drift.evaluate_scenario("shift", "", ref, shifted, THRESHOLD, baseline)
     assert s_same["alerts"]["data_drift"] is False
     assert s_shift["alerts"]["data_drift"] is True
-    assert {"LIMIT_BAL", "PAY_0", "BILL_AMT1"} <= set(s_shift["drifted_columns"])
+    assert {"LIMIT_BAL", "PAY_1", "BILL_AMT1"} <= set(s_shift["drifted_columns"])
     assert not set(PAY_AMT_COLS) & set(s_shift["drifted_columns"])
 
 

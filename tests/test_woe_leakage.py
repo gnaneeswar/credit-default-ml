@@ -51,7 +51,7 @@ def test_iv_table_ranks_known_signal_and_drops_weak(xy) -> None:
     X, y = xy
     sel = WoEIVSelector().fit(X, y)
     t = sel.iv_table_
-    assert t.loc[0, "feature"] in {"PAY_0", "N_DELINQ", "MAX_DELINQ"}
+    assert t.loc[0, "feature"] in {"PAY_1", "N_DELINQ", "MAX_DELINQ"}
     assert t["iv"].is_monotonic_decreasing
     assert set(sel.selected_features_) == set(t.loc[t["iv"] >= 0.02, "feature"])
     assert "SEX" not in sel.selected_features_
@@ -61,20 +61,20 @@ def test_iv_table_ranks_known_signal_and_drops_weak(xy) -> None:
 def test_rare_bins_are_merged(xy) -> None:
     X, y = xy
     sel = WoEIVSelector(min_bin_frac=0.01).fit(X, y)
-    counts = np.bincount(np.searchsorted(sel.cuts_["PAY_0"], X["PAY_0"], side="left"))
+    counts = np.bincount(np.searchsorted(sel.cuts_["PAY_1"], X["PAY_1"], side="left"))
     assert counts.min() >= 0.01 * len(X)
-    assert sel.bin_table("PAY_0")["high_incl"].iloc[-1] == np.inf
+    assert sel.bin_table("PAY_1")["high_incl"].iloc[-1] == np.inf
 
 
 def test_unseen_and_missing_values_are_handled(xy) -> None:
     X, y = xy
     sel = WoEIVSelector().fit(X, y)
     probe = X.head(2).copy()
-    probe.loc[0, "PAY_0"] = 99  # beyond training range -> top edge bin
-    probe.loc[1, "PAY_0"] = np.nan  # missing -> WoE 0
+    probe.loc[0, "PAY_1"] = 99  # beyond training range -> top edge bin
+    probe.loc[1, "PAY_1"] = np.nan  # missing -> WoE 0
     out = sel.transform(probe)
-    assert out.loc[0, "WOE_PAY_0"] == pytest.approx(sel.woe_["PAY_0"][-1])
-    assert out.loc[1, "WOE_PAY_0"] == 0.0
+    assert out.loc[0, "WOE_PAY_1"] == pytest.approx(sel.woe_["PAY_1"][-1])
+    assert out.loc[1, "WOE_PAY_1"] == 0.0
 
 
 def test_iv_strength_labels() -> None:

@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 
-PAY_STATUS = ["PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6"]
+PAY_STATUS = ["PAY_1", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6"]
 BILL_AMT = [f"BILL_AMT{i}" for i in range(1, 7)]
 PAY_AMT = [f"PAY_AMT{i}" for i in range(1, 7)]
 
@@ -85,10 +85,51 @@ ENGINEERED = [
     "N_PAID_FULL",
 ]
 
+# Billing-cycle accounting signals (aggregates + most recent month).
+ACCOUNTING = [
+    "HAS_CREDIT_BAL_1",
+    "N_CREDIT_BAL",
+    "MIN_CREDIT_BAL_RATIO",
+    "OVER_LIMIT_1",
+    "N_OVER_LIMIT",
+    "MAX_OVER_LIMIT_EXCESS",
+    "PAYDOWN_1",
+    "N_PAYDOWN",
+    "MAX_PAYDOWN_EXCESS",
+    "SPEND_1",
+    "SPEND_MEAN_3",
+    "SPEND_MEAN_5",
+]
+# Delinquency trajectory / roll-rate signals over the 5 transitions PAY_6 -> ... -> PAY_1.
+ROLL_RATE = [
+    "CURED_RECENT",
+    "N_CURES",
+    "ROLL_FWD_RECENT",
+    "N_ROLL_FWD",
+    "MAX_ROLL_FWD_STEP",
+    "N_DORMANT_TO_REVOLVER",
+    "ROLL_BACK_RECENT",
+    "N_ROLL_BACK",
+    "STAGNANT_RECENT",
+    "N_STAGNANT",
+    "MAX_DELINQ_STREAK",
+]
+ENGINEERED = [*ENGINEERED, *ACCOUNTING, *ROLL_RATE]
+
 # x-axis for 6-month trends in chronological order (Apr=0 … Sep=5), centred.
 _T = np.arange(6, dtype=float)
 _T_CENTRED = _T - _T.mean()
 _T_SS = float((_T_CENTRED**2).sum())
+
+
+def _longest_run(mask_chronological: np.ndarray) -> np.ndarray:
+    """Length of the longest run of consecutive True values per row."""
+    run = np.zeros(mask_chronological.shape[0])
+    best = np.zeros_like(run)
+    for j in range(mask_chronological.shape[1]):
+        run = np.where(mask_chronological[:, j], run + 1, 0)
+        best = np.maximum(best, run)
+    return best
 
 
 def _slope(values_recent_first: np.ndarray) -> np.ndarray:
@@ -107,11 +148,38 @@ class DomainFeatureEngineer(_StatelessFrameTransformer):
     * ``BILL_TREND`` / ``PAY_AMT_TREND`` = 6-month least-squares slope / LIMIT_BAL
                           (positive = balance or payments growing towards Sep 2005)
     * ``N_BILL_NONPOS`` = months with BILL_AMT <= 0 (amount-based inactivity)
-    * ``N_INACTIVE``    = months with PAY_n == -2 (status-based "no consumption").
+    * ``N_INACTIVE``    = months with PAY_n == -2 (status-based "inactive cycle").
                           Kept separate from N_BILL_NONPOS on purpose: the EDA shows -2
                           often co-occurs with a non-zero bill.
     * ``N_DELINQ`` = months with PAY_n > 0; ``MAX_DELINQ`` = worst delay (>= 0);
       ``N_REVOLVING`` = months with PAY_n == 0; ``N_PAID_FULL`` = months with PAY_n == -1
+
+    Billing-cycle accounting (every ratio is over LIMIT_BAL; nothing divides by a bill, and
+    negative bills are never clipped in signed features):
+
+    * credit balance (low risk): ``HAS_CREDIT_BAL_1`` (BILL_AMT1 < 0), ``N_CREDIT_BAL``,
+      ``MIN_CREDIT_BAL_RATIO`` = most negative min(BILL_AMT_n, 0) / LIMIT_BAL (<= 0)
+    * over limit (distress): ``OVER_LIMIT_1`` (BILL_AMT1 > LIMIT_BAL), ``N_OVER_LIMIT``,
+      ``MAX_OVER_LIMIT_EXCESS`` = max(BILL_AMT_n - LIMIT_BAL, 0) / LIMIT_BAL
+    * intra-cycle paydown (liquidity): ``PAYDOWN_1`` (PAY_AMT1 > BILL_AMT1), ``N_PAYDOWN``,
+      ``MAX_PAYDOWN_EXCESS`` = max(PAY_AMT_n - BILL_AMT_n, 0) / LIMIT_BAL
+    * implied spend_n = BILL_AMT_n - (BILL_AMT_(n+1) - PAY_AMT_n), n = 1..5, over LIMIT_BAL:
+      ``SPEND_1`` (latest), ``SPEND_MEAN_3`` / ``SPEND_MEAN_5`` (rolling means that smooth
+      calendar-month vs statement-cutoff payment timing; sign preserved)
+
+    Roll rates over the 5 consecutive transitions prev = PAY_(n+1) -> cur = PAY_n, moving
+    forward in time from PAY_6 to PAY_1 (``*_RECENT`` = the PAY_2 -> PAY_1 transition):
+
+    * cure: prev >= 2 and cur <= 0 -> ``CURED_RECENT``, ``N_CURES``
+    * roll forward (worsening): cur > prev and cur >= 1 -> ``ROLL_FWD_RECENT``, ``N_ROLL_FWD``,
+      ``MAX_ROLL_FWD_STEP`` = max(cur - max(prev, 0)). Moves among non-delinquent codes are
+      not worsening; ``-2 -> 2`` is a step of 2 missed due dates, not 4.
+    * dormant -> revolver activation: prev == -2 and cur == 0 -> ``N_DORMANT_TO_REVOLVER``
+      (no recent flag: PAY_2 = -2 -> PAY_1 = 0 never occurs in the data)
+    * roll backward (improving while past due): cur < prev, both > 0 -> ``ROLL_BACK_RECENT``,
+      ``N_ROLL_BACK``
+    * stagnation (chronic delay): cur == prev >= 2 -> ``STAGNANT_RECENT``, ``N_STAGNANT``,
+      ``MAX_DELINQ_STREAK`` = longest run of consecutive months with PAY >= 2
     """
 
     required = ["LIMIT_BAL", *PAY_STATUS, *BILL_AMT, *PAY_AMT]
@@ -147,8 +215,51 @@ class DomainFeatureEngineer(_StatelessFrameTransformer):
             "N_REVOLVING": (status == 0).sum(axis=1),
             "N_INACTIVE": (status == -2).sum(axis=1),
             "N_PAID_FULL": (status == -1).sum(axis=1),
+            **self._accounting(bills, pays, limit),
+            **self._roll_rates(status),
         }
-        engineered = pd.DataFrame(feats, index=X.index).astype(float)
+        engineered = pd.DataFrame(feats, index=X.index)[ENGINEERED].astype(float)
         # Only a non-positive LIMIT_BAL (never observed) can yield NaN; neutralise it.
         engineered = engineered.fillna(0.0)
         return pd.concat([X, engineered], axis=1)
+
+    @staticmethod
+    def _accounting(bills: np.ndarray, pays: np.ndarray, limit: np.ndarray) -> dict:
+        lim = limit[:, None]
+        implied_spend = bills[:, :5] - (bills[:, 1:] - pays[:, :5])  # n = 1..5
+        return {
+            "HAS_CREDIT_BAL_1": bills[:, 0] < 0,
+            "N_CREDIT_BAL": (bills < 0).sum(axis=1),
+            "MIN_CREDIT_BAL_RATIO": np.minimum(bills, 0).min(axis=1) / limit,
+            "OVER_LIMIT_1": bills[:, 0] > limit,
+            "N_OVER_LIMIT": (bills > lim).sum(axis=1),
+            "MAX_OVER_LIMIT_EXCESS": np.maximum(bills - lim, 0).max(axis=1) / limit,
+            "PAYDOWN_1": pays[:, 0] > bills[:, 0],
+            "N_PAYDOWN": (pays > bills).sum(axis=1),
+            "MAX_PAYDOWN_EXCESS": np.maximum(pays - bills, 0).max(axis=1) / limit,
+            "SPEND_1": implied_spend[:, 0] / limit,
+            "SPEND_MEAN_3": implied_spend[:, :3].mean(axis=1) / limit,
+            "SPEND_MEAN_5": implied_spend.mean(axis=1) / limit,
+        }
+
+    @staticmethod
+    def _roll_rates(status_recent_first: np.ndarray) -> dict:
+        chrono = status_recent_first[:, ::-1]  # PAY_6 (Apr) ... PAY_1 (Sep)
+        prev, cur = chrono[:, :-1], chrono[:, 1:]  # 5 transitions; last = PAY_2 -> PAY_1
+        cure = (prev >= 2) & (cur <= 0)
+        roll_fwd = (cur > prev) & (cur >= 1)
+        roll_back = (cur < prev) & (cur > 0) & (prev > 0)
+        stagnant = (cur == prev) & (cur >= 2)
+        return {
+            "CURED_RECENT": cure[:, -1],
+            "N_CURES": cure.sum(axis=1),
+            "ROLL_FWD_RECENT": roll_fwd[:, -1],
+            "N_ROLL_FWD": roll_fwd.sum(axis=1),
+            "MAX_ROLL_FWD_STEP": np.where(roll_fwd, cur - np.maximum(prev, 0), 0).max(axis=1),
+            "N_DORMANT_TO_REVOLVER": ((prev == -2) & (cur == 0)).sum(axis=1),
+            "ROLL_BACK_RECENT": roll_back[:, -1],
+            "N_ROLL_BACK": roll_back.sum(axis=1),
+            "STAGNANT_RECENT": stagnant[:, -1],
+            "N_STAGNANT": stagnant.sum(axis=1),
+            "MAX_DELINQ_STREAK": _longest_run(chrono >= 2),
+        }

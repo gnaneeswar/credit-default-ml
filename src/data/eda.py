@@ -65,6 +65,96 @@ def pay_bill_consistency(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+SEGMENTS = {
+    # name: (description, mask over engineered features `f` and raw frame `df`)
+    "never_late": ("no month with PAY_n > 0", lambda f, df: f["N_DELINQ"] == 0),
+    "cured_now_current": (
+        "had a cure (PAY_(n+1) >= 2 -> PAY_n <= 0) and PAY_1 <= 0",
+        lambda f, df: (f["N_CURES"] > 0) & (df["PAY_1"] <= 0),
+    ),
+    "roll_forward": ("any worsening into delinquency", lambda f, df: f["N_ROLL_FWD"] > 0),
+    "roll_backward": ("any improvement while past due", lambda f, df: f["N_ROLL_BACK"] > 0),
+    "stagnant": ("stuck at the same PAY >= 2", lambda f, df: f["N_STAGNANT"] > 0),
+    "dormant_to_revolver": ("any -2 -> 0 activation", lambda f, df: f["N_DORMANT_TO_REVOLVER"] > 0),
+    "over_limit": ("any BILL_AMT_n > LIMIT_BAL", lambda f, df: f["N_OVER_LIMIT"] > 0),
+    "credit_balance": ("any BILL_AMT_n < 0", lambda f, df: f["N_CREDIT_BAL"] > 0),
+    "paydown": ("any PAY_AMT_n > BILL_AMT_n", lambda f, df: f["N_PAYDOWN"] > 0),
+}
+
+
+def domain_rule_checks(df: pd.DataFrame) -> dict:
+    """Test the billing-cycle domain rules against the data (descriptive, full dataset).
+
+    Segments are defined through DomainFeatureEngineer outputs, so the EDA and the model
+    share a single definition of every rule.
+    """
+    from src.features.domain import DomainCleaner, DomainFeatureEngineer
+
+    X = df[schema.FEATURES]
+    f = DomainFeatureEngineer().fit_transform(DomainCleaner().fit_transform(X))
+    y = df[schema.TARGET]
+
+    timing = []
+    for k, col in enumerate(schema.PAY_STATUS_COLS, start=1):
+        paid = df[df[col] == -1]
+        row: dict = {"status": col, "n_paid_in_full": len(paid)}
+        if k < 6:  # brief's section-4 pairing: previous statement (k+1) settled in month k
+            s = paid[paid[f"BILL_AMT{k + 1}"] > 0]
+            row["rule_pairing"] = f"PAY_AMT{k} >= BILL_AMT{k + 1}"
+            row["rule_share"] = float((s[f"PAY_AMT{k}"] >= s[f"BILL_AMT{k + 1}"]).mean())
+        if k > 1:  # one month later: statement k settled in the following month (k-1)
+            s = paid[paid[f"BILL_AMT{k}"] > 0]
+            row["next_month_pairing"] = f"PAY_AMT{k - 1} >= BILL_AMT{k}"
+            row["next_month_share"] = float((s[f"PAY_AMT{k - 1}"] >= s[f"BILL_AMT{k}"]).mean())
+        timing.append(row)
+
+    inactive = [
+        {
+            "status": p,
+            "n_inactive": int((df[p] == -2).sum()),
+            "share_bill_le_0": float((df.loc[df[p] == -2, b] <= 0).mean()),
+        }
+        for p, b in zip(schema.PAY_STATUS_COLS, schema.BILL_AMT_COLS, strict=True)
+    ]
+
+    segments = {"base": {"description": "all rows", "n": len(df), "default_rate": float(y.mean())}}
+    for name, (desc, rule) in SEGMENTS.items():
+        m = rule(f, df)
+        segments[name] = {
+            "description": desc,
+            "n": int(m.sum()),
+            "default_rate": float(y[m].mean()),
+        }
+
+    chrono = df[schema.PAY_STATUS_COLS[::-1]].to_numpy()
+    transitions = []
+    for j in range(chrono.shape[1] - 1):
+        prev, cur = chrono[:, j], chrono[:, j + 1]
+        transitions.append(
+            {
+                "transition": f"{schema.PAY_STATUS_COLS[::-1][j]} -> {schema.PAY_STATUS_COLS[::-1][j + 1]}",
+                "cure": int(((prev >= 2) & (cur <= 0)).sum()),
+                "roll_forward": int(((cur > prev) & (cur >= 1)).sum()),
+                "roll_backward": int(((cur < prev) & (cur > 0) & (prev > 0)).sum()),
+                "stagnant": int(((cur == prev) & (cur >= 2)).sum()),
+                "dormant_to_revolver": int(((prev == -2) & (cur == 0)).sum()),
+            }
+        )
+    codes = (
+        pd.DataFrame({c: df[c].value_counts() for c in schema.PAY_STATUS_COLS})
+        .reindex(range(-2, 10))
+        .fillna(0)
+        .astype(int)
+    )
+    return {
+        "status_code_counts": {str(k): v for k, v in codes.to_dict(orient="index").items()},
+        "timing_alignment": timing,
+        "inactive_vs_bill": inactive,
+        "segments": segments,
+        "transition_counts": transitions,
+    }
+
+
 def build_summary(df: pd.DataFrame, train: pd.DataFrame, test: pd.DataFrame) -> dict:
     target = df[schema.TARGET]
     codes = {c: code_table(df, c) for c in _DOCUMENTED}
@@ -110,18 +200,64 @@ def build_summary(df: pd.DataFrame, train: pd.DataFrame, test: pd.DataFrame) -> 
         "pay_code_bill_consistency": json.loads(
             pay_bill_consistency(df).round(4).to_json(orient="records")
         ),
+        "domain_rule_checks": domain_rule_checks(df),
     }
 
 
-def _pay0_consistency(summary: dict) -> pd.DataFrame:
+def _pay1_consistency(summary: dict) -> pd.DataFrame:
     t = pd.DataFrame(summary["pay_code_bill_consistency"])
-    return t[t["pay_col"] == "PAY_0"]
+    return t[t["pay_col"] == "PAY_1"]
+
+
+def _domain_rule_section(checks: dict) -> list[str]:
+    seg = pd.DataFrame(checks["segments"]).T.reset_index(names="segment")
+    seg["default_rate"] = seg["default_rate"].astype(float)
+    return [
+        "## Billing-cycle domain rules vs the data",
+        "",
+        "### Status-code counts per month",
+        "",
+        render_table(
+            pd.DataFrame(checks["status_code_counts"])
+            .T.loc[["-2", "-1", "0", "1", "2", "3"]]
+            .reset_index(names="code")
+        ),
+        "",
+        "→ Code `1` (one missed due date) is common in `PAY_1` but almost absent from",
+        "  `PAY_2`..`PAY_6`: the source coded the latest month differently. Transition features",
+        "  therefore isolate the latest transition in `*_RECENT` flags rather than relying only",
+        "  on 6-month counts that mix both regimes.",
+        "",
+        "### Timing: which payment confirms a 'paid in full' status?",
+        "",
+        render_table(pd.DataFrame(checks["timing_alignment"]), floatfmt=".3f"),
+        "",
+        "→ The section-4 rule pairs status k with the previous statement (k+1) paid in month k.",
+        "  The data matches a one-month-later pairing far better (statement k covered by the",
+        "  next month's payment), so status codes are documented as the rule *plus* this check.",
+        "",
+        "### Is '-2 => BILL_AMT_n <= 0' true?",
+        "",
+        render_table(pd.DataFrame(checks["inactive_vs_bill"]), floatfmt=".3f"),
+        "",
+        "### Default rate by behavioural segment (definitions = engineered features)",
+        "",
+        render_table(seg, floatfmt=".4f"),
+        "",
+        "### Transition counts per month pair",
+        "",
+        render_table(pd.DataFrame(checks["transition_counts"])),
+        "",
+        "→ `-2 -> 0` (dormant -> revolver) never occurs in the latest transition (PAY_2 -> PAY_1),",
+        "  so it is engineered only as a 6-month count, not as a most-recent-month flag.",
+        "",
+    ]
 
 
 def render_report(summary: dict, codes: dict[str, pd.DataFrame]) -> str:
     tb = summary["target_balance"]
     sh = summary["shapes"]
-    pay0 = codes["PAY_0"]
+    pay1 = codes["PAY_1"]
     lines = [
         "# EDA Report — Default of Credit Card Clients",
         "",
@@ -153,9 +289,9 @@ def render_report(summary: dict, codes: dict[str, pd.DataFrame]) -> str:
         "→ MARRIAGE 0 has too few rows to estimate its own risk reliably; it is merged into",
         "  3 'others' on semantic grounds (unknown ≈ not married/single), not because rates match.",
         "",
-        "### PAY_0 (most recent month; PAY_2..PAY_6 behave the same — see eda_summary.json)",
+        "### PAY_1 (most recent month; PAY_2..PAY_6 behave the same — see eda_summary.json)",
         "",
-        render_table(pay0),
+        render_table(pay1),
         "",
         "→ `0` (revolving, minimum paid) is the most common code and `-2` (inactive) is common;",
         "  both default *less* often than `-1` (paid duly), so collapsing them into `-1` would",
@@ -163,13 +299,14 @@ def render_report(summary: dict, codes: dict[str, pd.DataFrame]) -> str:
         "",
         "### Do the low codes match their definitions? (same-month bill / payment)",
         "",
-        render_table(_pay0_consistency(summary)),
+        render_table(_pay1_consistency(summary)),
         "",
         "→ `0` (revolving) carries large balances and `-1` (paid in full) small ones, as defined.",
-        "  `-2` (no consumption) often still shows a non-zero bill (residual balance, fees or",
+        "  `-2` (inactive cycle) often still shows a non-zero bill (residual balance, fees or",
         "  credits), so the pipeline never infers one signal from the other: `PAY_n == -2` counts",
         "  and `BILL_AMT <= 0` flags are separate engineered features.",
         "",
+        *_domain_rule_section(summary["domain_rule_checks"]),
         "## Numeric distributions",
         "",
         render_table(
@@ -202,8 +339,13 @@ def run_eda(df: pd.DataFrame | None = None, settings: Settings | None = None) ->
         tb["default_rate_full"],
         tb["imbalance_ratio_neg_to_pos"],
     )
-    for col in ("EDUCATION", "MARRIAGE", "PAY_0"):
+    for col in ("EDUCATION", "MARRIAGE", "PAY_1"):
         log_table(log, f"code table: {col}", codes[col])
+    log_table(
+        log,
+        "segment default rates (domain rules vs data)",
+        pd.DataFrame(summary["domain_rule_checks"]["segments"]).T.reset_index(names="segment"),
+    )
     log.info(
         "undocumented codes found: %s",
         {k: list(v) for k, v in summary["undocumented_codes"].items() if v},

@@ -11,6 +11,7 @@ split is deterministic, and evaluate/monitor read the champion back from the reg
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from dataclasses import dataclass, field
@@ -134,6 +135,37 @@ def stage_train(ctx: Context) -> None:
         frame.to_csv(path, index=False, lineterminator="\n")
         log_path_io(log, "write", path)
 
+    # Report inputs: model grids (from the built specs) and OOF metrics at the threshold.
+    from sklearn.metrics import average_precision_score, roc_auc_score
+
+    reports = {
+        out / "model_grids.json": {
+            "cv": {
+                "splitter": "StratifiedKFold",
+                "n_splits": s.n_splits,
+                "shuffle": True,
+                "random_state": s.seed,
+                "search": "GridSearchCV",
+                "scoring": "f1",
+                "metrics": ["f1", "roc_auc", "pr_auc", "precision", "recall"],
+                "n_jobs": -1,
+                "refit": False,
+            },
+            "models": [spec.describe(s, pos_weight) for spec in specs],
+        },
+        out / "train_oof_metrics.json": {
+            "source": f"{s.n_splits}-fold out-of-fold predictions on the training split",
+            "model": best.spec.name,
+            "n_rows": int(len(y)),
+            **choice.as_dict(),
+            "roc_auc": float(roc_auc_score(y, oof)),
+            "pr_auc": float(average_precision_score(y, oof)),
+        },
+    }
+    for path, payload in reports.items():
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8", newline="\n")
+        log_path_io(log, "write", path)
+
     import mlflow
 
     with mlflow.start_run(run_name="training-pipeline", experiment_id=exp_id) as parent:
@@ -152,7 +184,7 @@ def stage_train(ctx: Context) -> None:
         )
         for r in results:
             log_child_run(r, exp_id, s.n_splits)
-        for path in frames:
+        for path in [*frames, *reports]:
             mlflow.log_artifact(str(path))
         for path in (out / "eda_summary.json", out / "eda_report.md"):
             if path.exists():
@@ -202,12 +234,19 @@ def stage_monitor(ctx: Context) -> None:
     run_monitoring(ctx.settings, pool=ctx.monitor_pool)
 
 
+def stage_report(ctx: Context) -> None:
+    from src.reporting.ppt import build_from_artifacts
+
+    build_from_artifacts(ctx.settings)
+
+
 STAGES = {
     "ingest": stage_ingest,
     "eda": stage_eda,
     "train": stage_train,
     "evaluate": stage_evaluate,
     "monitor": stage_monitor,
+    "report": stage_report,
 }
 DEFAULT_STAGES = list(STAGES)
 

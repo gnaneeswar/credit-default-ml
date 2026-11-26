@@ -20,5 +20,5 @@ Run every step in order; **stop and report** on the first failure (do not commit
 3. **Hygiene** — `git status --porcelain` must not list `.venv/`, `mlruns/`, `*.db*`, `artifacts/*` (except `.gitkeep`), `.env*`, or caches. If it does, fix `.gitignore` first.
 4. **Update `PROGRESS.md`** — tick the finished phase, rewrite "Next steps", note open issues/decisions. Keep it short.
 5. **Atomic commit** — stage only this phase's files (`git add <paths>`, never blind `-A` without reviewing `git status`). Conventional message, e.g. `feat(p1): ingest UCI dataset, data dictionary, EDA`, body = 2-4 bullet summary, ending with the attribution trailer required by the session.
-6. **Push** — `git push -u origin main`. If auth fails, report it to the user; do not change remotes or credentials without asking.
+6. **Push** — `git push -u origin HEAD` (pushes the current branch; on a feature branch this does NOT touch `main`). If auth fails, report it to the user; do not change remotes or credentials without asking.
 7. Report: phase, commit hash, test count, push result.

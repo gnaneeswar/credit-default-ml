@@ -20,6 +20,7 @@ dependencies = [
     "matplotlib>=3.9",
     "evidently>=0.7",
     "ucimlrepo>=0.0.7",
+    "python-pptx>=1.0",
 ]
 
 [dependency-groups]
