@@ -97,53 +97,82 @@ def refit_with_oof(
     return winner, oof, dict(zip(extra, extra_fitted, strict=True))
 
 
+DECILE_COLUMNS = [
+    "decile",
+    "n",
+    "share",
+    "n_default",
+    "bad_rate",
+    "lift",
+    "cum_capture",
+    "cum_lift",
+    "min_score",
+    "max_score",
+    "cutoff",
+    "precision",
+    "recall",
+    "f1",
+]
+
+
+def _summarise_bands(
+    y: np.ndarray, proba: np.ndarray, band: np.ndarray, cutoffs: dict[int, float]
+) -> pd.DataFrame:
+    """Per-band lift table. ``cutoffs[k]`` is band k's lower score bound: row k also reports
+    the metrics of the policy 'flag every account with score >= cutoffs[k]'. Empty bands
+    (possible on new data) are kept as zero rows rather than dropped."""
+    df = pd.DataFrame({"decile": band, "y": y, "p": proba})
+    base_rate, total_bad = y.mean(), y.sum()
+    g = (
+        df.groupby("decile")
+        .agg(
+            n=("y", "size"), n_default=("y", "sum"), min_score=("p", "min"), max_score=("p", "max")
+        )
+        .reindex(range(1, 11))
+    )
+    g[["n", "n_default"]] = g[["n", "n_default"]].fillna(0).astype(int)
+    g["share"] = g["n"] / len(y)
+    g["bad_rate"] = np.divide(g["n_default"], g["n"], out=np.zeros(10), where=g["n"] > 0)
+    g["lift"] = g["bad_rate"] / base_rate
+    cum_n, cum_bad = g["n"].cumsum(), g["n_default"].cumsum()
+    g["cum_capture"] = cum_bad / total_bad
+    g["cum_lift"] = np.divide(cum_bad, cum_n, out=np.zeros(10), where=cum_n > 0) / base_rate
+    g["cutoff"] = pd.Series(cutoffs)
+    metrics = [_metrics_at(y, proba, c) for c in g["cutoff"]]
+    g["f1"], g["precision"], g["recall"] = zip(*metrics, strict=True)
+    return g.reset_index()[DECILE_COLUMNS]
+
+
 def decile_table(y: pd.Series | np.ndarray, proba: np.ndarray) -> pd.DataFrame:
-    """10-row lift table; row k also reports metrics for the cutoff 'flag deciles 1..k'."""
+    """10-row lift table on equal-count score deciles (decile 1 = riskiest 10%)."""
     y = np.asarray(y, dtype=int)
     order = np.argsort(-proba, kind="stable")
-    decile_of_rank = np.arange(len(proba)) * 10 // len(proba) + 1  # rank-based: no ties issue
     decile = np.empty(len(proba), dtype=int)
-    decile[order] = decile_of_rank
-    df = pd.DataFrame({"decile": decile, "y": y, "p": proba})
-    base_rate = y.mean()
-    total_bad = y.sum()
+    decile[order] = np.arange(len(proba)) * 10 // len(proba) + 1  # rank-based: no ties issue
+    cutoffs = pd.Series(proba).groupby(decile).min().to_dict()
+    return _summarise_bands(y, proba, decile, cutoffs)
 
-    g = df.groupby("decile").agg(
-        n=("y", "size"), n_default=("y", "sum"), min_score=("p", "min"), max_score=("p", "max")
-    )
-    g["bad_rate"] = g["n_default"] / g["n"]
-    g["lift"] = g["bad_rate"] / base_rate
-    g["cum_n"] = g["n"].cumsum()
-    g["cum_default"] = g["n_default"].cumsum()
-    g["cum_capture"] = g["cum_default"] / total_bad
-    g["cum_lift"] = (g["cum_default"] / g["cum_n"]) / base_rate
 
-    # Metrics if the cutoff is this decile's lower bound (score >= min_score is flagged).
-    rows = []
-    for k, cutoff in g["min_score"].items():
-        f1, precision, recall = _metrics_at(y, proba, cutoff)
-        rows.append(
-            {"decile": k, "cutoff": cutoff, "precision": precision, "recall": recall, "f1": f1}
-        )
-    cut = pd.DataFrame(rows).set_index("decile")
-    out = g.join(cut).reset_index()
-    return out[
-        [
-            "decile",
-            "n",
-            "n_default",
-            "bad_rate",
-            "lift",
-            "cum_capture",
-            "cum_lift",
-            "min_score",
-            "max_score",
-            "cutoff",
-            "precision",
-            "recall",
-            "f1",
-        ]
-    ]
+def banded_decile_table(
+    y: pd.Series | np.ndarray, proba: np.ndarray, reference: pd.DataFrame
+) -> pd.DataFrame:
+    """Lift table for a *new* batch using the reference (training OOF) decile score bands.
+
+    Band k = scores in [reference cutoff_k, cutoff_(k-1)); scores below the reference's
+    lowest cutoff fall into band 10. Rows therefore line up with the training table, and the
+    per-band ``share`` shows whether the score distribution is stable (ideal: 10% each).
+    """
+    y = np.asarray(y, dtype=int)
+    cut = reference.set_index("decile")["cutoff"].sort_index()
+    band = 1 + (np.asarray(proba)[:, None] < cut.loc[1:9].to_numpy()[None, :]).sum(axis=1)
+    return _summarise_bands(y, np.asarray(proba), band, cut.to_dict())
+
+
+def population_stability_index(expected: pd.Series, actual: pd.Series, eps: float = 1e-4) -> float:
+    """PSI between two band-share distributions (< 0.1 stable, 0.1-0.25 shift, > 0.25 major)."""
+    e = np.clip(np.asarray(expected, dtype=float), eps, None)
+    a = np.clip(np.asarray(actual, dtype=float), eps, None)
+    return float(((a - e) * np.log(a / e)).sum())
 
 
 def _metrics_at(y: np.ndarray, proba: np.ndarray, cutoff: float) -> tuple[float, float, float]:

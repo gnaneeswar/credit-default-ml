@@ -161,3 +161,22 @@ def test_registry_roundtrip_in_fresh_serving_process(small_xy, tiny_champion) ->
     assert result["threshold"] == pytest.approx(TINY_THRESHOLD)
     assert result["columns"] == list(X.columns)
     np.testing.assert_allclose(result["proba"], pipe.predict_proba(X.head(4))[:, 1])
+
+
+def test_banded_deciles_reproduce_reference_and_measure_stability() -> None:
+    from src.training.threshold import banded_decile_table, population_stability_index
+
+    rng = np.random.default_rng(3)
+    proba = rng.random(4000)
+    y = (rng.random(4000) < proba**2).astype(int)
+    ref = decile_table(y, proba)
+    same = banded_decile_table(y, proba, ref)  # a batch on its own bands == the reference
+    cols = ["n", "n_default", "bad_rate", "cum_capture", "lift", "f1"]
+    np.testing.assert_allclose(same[cols].to_numpy(float), ref[cols].to_numpy(float))
+    assert population_stability_index(ref["share"], same["share"]) == pytest.approx(0.0)
+
+    shifted = banded_decile_table(y, np.clip(proba + 0.2, 0, 1), ref)
+    assert list(shifted["decile"]) == list(range(1, 11))  # empty bands kept, not dropped
+    assert shifted["n"].sum() == len(y) and shifted.loc[9, "n"] == 0
+    assert np.isfinite(shifted[["bad_rate", "lift", "cum_lift"]].to_numpy()).all()
+    assert population_stability_index(ref["share"], shifted["share"]) > 0.25

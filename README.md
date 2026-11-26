@@ -136,6 +136,21 @@ Confusion at 0.478: the model catches **791 of 1,327 defaults** and flags 775 go
 **Lift:** the riskiest 10% of clients default at 3.2× the base rate. The top 30% contain
 64% of all defaults.
 
+**Holdout deciles on the training score bands** (`artifacts/test_decile_analysis.csv`). The
+training OOF decile cutoffs are applied unchanged to the 6,000 holdout scores, so each row
+compares like for like with the training table:
+
+| Decile | Train bad rate | Holdout bad rate | Train cum. capture | Holdout cum. capture | Holdout share |
+|---|---|---|---|---|---|
+| 1 | 70.2% | 70.0% | 31.8% | 32.3% | 10.2% |
+| 3 (operating) | 27.6% | 25.5% | 63.9% | 63.6% | 10.0% |
+| 10 | 3.9% | 4.7% | 100% | 100% | 8.9% |
+
+The rank-ordering holds on unseen data. Holdout band shares stay at 8.9–10.6% (the
+training bands hold 10% each by construction), giving a **score PSI of 0.003**, far below
+the usual 0.1 "stable" threshold. A PSI on these same bands is the natural production
+monitor for score drift.
+
 **Monitoring** (Evidently, compared against the out-of-fold training baseline):
 
 | Batch | Drifted features | F1 (Δ) | Alerts |
@@ -530,9 +545,10 @@ curl -s -X POST localhost:8000/invocations -H 'Content-Type: application/json' \
 | `artifacts/cv_comparison.csv` | best candidate per model family (CV F1, ROC-AUC, PR-AUC, precision, recall) |
 | `artifacts/iv_table.csv` | WoE/IV ranking and selection |
 | `artifacts/train_decile_analysis.csv` | OOF decile lift, bad rate, capture and F1-at-cutoff table |
+| `artifacts/test_decile_analysis.csv` | holdout lift table on the **training** score bands, with band shares; `test_metrics.json` adds `score_psi_vs_train_bands` |
 | `artifacts/test_metrics.json`, `test_confusion_matrix.{json,png}` | holdout evaluation of `@champion` |
 | `artifacts/monitoring_report*.html`, `monitoring_summary.json` | Evidently reports and alert summary |
-| `artifacts/credit_default_summary.pptx` | **interview deck** (16:9, cover + 4 slides: EDA observations, candidate models and CV grids, top 3 models, OOF vs test and deciles), rebuilt from the artifacts on every run; `uv run python -m src.reporting.ppt` rebuilds it alone |
+| `artifacts/credit_default_summary.pptx` | **interview deck** (16:9, cover + 4 slides: EDA observations, candidate models and CV grids, top 3 models, and Train OOF vs Holdout metrics with both decile tables side by side), rebuilt from the artifacts on every run; `uv run python -m src.reporting.ppt` rebuilds it alone |
 | `artifacts/model_grids.json`, `train_oof_metrics.json` | deck inputs: model grids, imbalance handling and CV setup (generated from the model specs), and OOF metrics at the threshold |
 | `artifacts/batch_predictions.csv` | batch client output: actual vs predicted |
 | `mlruns/` | MLflow tracking database, model registry and artifacts |
@@ -543,7 +559,7 @@ To browse the runs (optional, read-only UI): `uvx mlflow ui --backend-store-uri 
 
 ```bash
 uv sync                                   # Python 3.12 venv from uv.lock
-uv run pytest -q                          # 106 offline tests
+uv run pytest -q                          # 109 offline tests
 uv run ruff check . && uv run ruff format --check .
 uv run python -m src.training.run         # all stages (or --stages / --models)
 uv run uvicorn src.inference.app:app --port 8000

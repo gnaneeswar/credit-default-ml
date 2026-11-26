@@ -36,6 +36,7 @@ INPUTS = {
     "oof": "train_oof_metrics.json",
     "test": "test_metrics.json",
     "deciles": "train_decile_analysis.csv",
+    "test_deciles": "test_decile_analysis.csv",
 }
 
 TITLES = [
@@ -156,6 +157,7 @@ def _table(
     header_h: float = 0.45,
     highlight: int | None = None,
     align_right_from: int | None = None,
+    row_min: float = 0.36,
 ) -> float:
     """Add a styled table; returns its height. ``highlight`` = data-row index to accent."""
     if not rows:
@@ -167,7 +169,7 @@ def _table(
         need = max(
             _text_height([c], w - 0.12, cell_pt, 1.15) for c, w in zip(row, col_w, strict=True)
         )
-        row_h.append(max(0.36, need + 0.1))
+        row_h.append(max(row_min, need + 0.1))
     height = header_h + sum(row_h)
     if height > box.h + 1e-6:
         raise LayoutError(f"{name}: table needs {height:.2f}in, box has {box.h:.2f}in")
@@ -454,43 +456,8 @@ def _top3_slide(prs, inp: dict) -> None:
     )
 
 
-def _results_slide(prs, inp: dict) -> None:
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    _title(slide, TITLES[4])
-    oof, test = inp["oof"], inp["test"]["at_registered_threshold"]
-    metrics = [
-        ("Threshold", "threshold"),
-        ("F1", "f1"),
-        ("ROC-AUC", "roc_auc"),
-        ("PR-AUC", "pr_auc"),
-        ("Precision", "precision"),
-        ("Recall", "recall"),
-    ]
-    rows = [[label, f"{oof[k]:.4f}", f"{test[k]:.4f}"] for label, k in metrics]
-    left_w = 5.0
-    h = _table(
-        slide,
-        Box(MARGIN, TOP, left_w, 3.4),
-        ["Metric", "Train (3-fold OOF)", "Holdout (20%)"],
-        rows,
-        [1.5, 1.75, 1.75],
-        "table:oof_vs_test",
-        align_right_from=1,
-    )
-    k = math.ceil(oof["top_percent_flagged"] / 10)
-    notes = [
-        f"Operating point: flag riskiest {oof['top_percent_flagged']}% "
-        f"(cutoff {oof['threshold']:.3f}; decile {k} highlighted)",
-        f"Generalisation gap: ΔF1 {test['f1'] - oof['f1']:+.3f}, "
-        f"ΔROC-AUC {test['roc_auc'] - oof['roc_auc']:+.3f}",
-    ]
-    y = TOP + h + 0.3
-    _textbox(
-        slide, Box(MARGIN, y, left_w, BOTTOM - y), notes, NOTE_PT, SLATE, "notes", bullets=True
-    )
-
-    d = inp["deciles"]
-    drows = [
+def _decile_rows(d: pd.DataFrame) -> list[list[str]]:
+    return [
         [
             str(int(r.decile)),
             f"{int(r.n):,}",
@@ -502,19 +469,74 @@ def _results_slide(prs, inp: dict) -> None:
         ]
         for r in d.itertuples()
     ]
-    x = MARGIN + left_w + 0.4
-    _table(
+
+
+def _results_slide(prs, inp: dict) -> None:
+    """Top: Train (OOF) vs Holdout metrics strip. Bottom: train and holdout decile tables
+    side by side; the holdout uses the *training* score bands, so rows line up."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _title(slide, TITLES[4])
+    oof, test = inp["oof"], inp["test"]["at_registered_threshold"]
+    metrics = [
+        ("Threshold", "threshold"),
+        ("F1", "f1"),
+        ("ROC-AUC", "roc_auc"),
+        ("PR-AUC", "pr_auc"),
+        ("Precision", "precision"),
+        ("Recall", "recall"),
+    ]
+    strip = [
+        ["Train (3-fold OOF)", *(f"{oof[k]:.4f}" for _, k in metrics)],
+        ["Holdout (20%)", *(f"{test[k]:.4f}" for _, k in metrics)],
+    ]
+    h = _table(
         slide,
-        Box(x, TOP, SLIDE_W - MARGIN - x, BOTTOM - TOP),
-        ["Decile", "Accounts", "Defaults", "Bad rate", "Cum. capture", "Lift", "Cutoff F1"],
-        drows,
-        [0.8, 1.0, 1.0, 1.05, 1.25, 0.8, 1.033],
-        "table:deciles",
-        cell_pt=DECILE_PT,
+        Box(MARGIN, TOP, CONTENT_W, 1.2),
+        ["Dataset", *(m for m, _ in metrics)],
+        strip,
+        [2.333] + [1.6667] * 6,
+        "table:metrics",
         header_h=0.42,
-        highlight=k - 1,
         align_right_from=1,
     )
+
+    k = math.ceil(oof["top_percent_flagged"] / 10)  # operating decile
+    psi = inp["test"].get("score_psi_vs_train_bands")
+    gap = 0.4
+    half = (CONTENT_W - gap) / 2
+    label_y = TOP + h + 0.15
+    labels = [
+        f"Train (3-fold OOF) · decile {k} = riskiest {oof['top_percent_flagged']}%",
+        "Holdout (train score bands)"
+        + (f" · PSI {psi:.3f}" if psi is not None else "")
+        + f" · ΔF1 {test['f1'] - oof['f1']:+.3f}",
+    ]
+    table_y = label_y + 0.42
+    header = ["Decile", "Accounts", "Defaults", "Bad rate", "Cum. capture", "Lift", "Cutoff F1"]
+    widths = [0.62, 0.9, 0.85, 0.85, 1.05, 0.66, 1.0365]
+    for i, (frame, label, name) in enumerate(
+        [
+            (inp["deciles"], labels[0], "deciles_train"),
+            (inp["test_deciles"], labels[1], "deciles_test"),
+        ]
+    ):
+        x = MARGIN + i * (half + gap)
+        _textbox(
+            slide, Box(x, label_y, half, 0.4), [label], NOTE_PT, NAVY, f"label:{name}", bold=True
+        )
+        _table(
+            slide,
+            Box(x, table_y, half, BOTTOM - table_y),
+            header,
+            _decile_rows(frame),
+            widths,
+            f"table:{name}",
+            cell_pt=DECILE_PT,
+            header_h=0.5,
+            highlight=k - 1,
+            align_right_from=1,
+            row_min=0.33,
+        )
 
 
 # ---------------------------------------------------------------------------- build

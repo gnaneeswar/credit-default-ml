@@ -223,8 +223,10 @@ def stage_evaluate(ctx: Context) -> None:
             "test_metrics.json",
             "test_confusion_matrix.json",
             "test_confusion_matrix.png",
+            "test_decile_analysis.csv",
         ):
-            mlflow.log_artifact(str(s.artifacts_dir / name), artifact_path="holdout")
+            if (s.artifacts_dir / name).exists():
+                mlflow.log_artifact(str(s.artifacts_dir / name), artifact_path="holdout")
     log.info("holdout metrics logged to run %s", run_id)
 
 
