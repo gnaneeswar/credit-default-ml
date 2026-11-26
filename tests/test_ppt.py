@@ -132,13 +132,17 @@ def write_synthetic_artifacts(d: Path, holdout_f1: float = 0.6123) -> None:
                 "cv_f1_std": 0.005,
                 "n_candidates": 4,
                 "seconds": 1.0,
+                "oof_f1_tuned": oof,
+                "oof_threshold": 0.52,
                 "best_params": json.dumps(bp),
             }
-            for m, f1, bp in [
-                ("random_forest", 0.549, {"max_depth": 12, "min_samples_leaf": 10}),
-                ("xgboost", 0.545, {"learning_rate": 0.05, "max_depth": 3}),
-                ("lightgbm", 0.543, {"learning_rate": 0.05, "num_leaves": 31}),
-                ("logistic_regression", 0.535, {"C": 10.0, "class_weight": "balanced"}),
+            # CV F1@0.5 would pick the RF; the deployed metric (OOF F1 at own cutoff) picks
+            # XGBoost — the deck must follow the deployed metric.
+            for m, f1, oof, bp in [
+                ("random_forest", 0.549, 0.5470, {"max_depth": 12, "min_samples_leaf": 10}),
+                ("xgboost", 0.545, 0.5475, {"learning_rate": 0.05, "max_depth": 3}),
+                ("lightgbm", 0.543, 0.5472, {"learning_rate": 0.05, "num_leaves": 31}),
+                ("logistic_regression", 0.535, 0.5400, {"C": 10.0, "class_weight": "balanced"}),
             ]
         ]
     ).to_csv(d / "cv_comparison.csv", index=False)
@@ -288,7 +292,7 @@ def test_numbers_come_from_artifacts(tmp_path) -> None:
     holdout = next(r for r in range(len(table.rows)) if table.cell(r, 0).text.startswith("Hold"))
     assert table.cell(holdout, f1_col).text == "0.6123"
     cover = " ".join(s.text_frame.text for s in prs.slides[0].shapes if s.has_text_frame)
-    assert "0.612" in cover and "Random Forest" in cover
+    assert "0.612" in cover and "XGBoost" in cover  # champion by the deployed metric
 
 
 def test_missing_inputs_and_overflow_fail_loudly(tmp_path) -> None:
@@ -344,3 +348,9 @@ def test_compact_series() -> None:
     assert ppt._compact(["BILL_AMT1", "BILL_AMT2", "BILL_AMT3", "SEX"]) == "BILL_AMT1–3, SEX"
     assert ppt._compact(["PAY_1", "PAY_3"]) == "PAY_1, PAY_3"  # not consecutive
     assert ppt._compact(["SPEND_1", "SPEND_MEAN_3"]) == "SPEND_1, SPEND_MEAN_3"
+
+
+def test_top3_ranked_by_deployed_metric(deck) -> None:
+    rows = _table_rows(slide(deck, "top3"), "table:top3")
+    assert rows[0][3] == "OOF F1 @ own cutoff"
+    assert [r[1] for r in rows[1:]] == ["XGBoost", "LightGBM", "Random Forest"]

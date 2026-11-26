@@ -5,10 +5,12 @@
 #   docker compose --profile score run --rm --no-deps score
 #
 # Containers run as your host user so files written to ./mlruns and ./artifacts stay yours.
-# Defaults to 1000:1000; otherwise run: UID=$(id -u) GID=$(id -g) docker compose up --build
+# Defaults to 1000:1000; otherwise run:
+#   HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose up --build
+# (not UID/GID: bash's UID is read-only and never exported, so ${UID} is always unset here.)
 name: credit-default-ml
 
-x-runtime-user: &runtime-user "${UID:-1000}:${GID:-1000}"
+x-runtime-user: &runtime-user "${HOST_UID:-1000}:${HOST_GID:-1000}"
 
 services:
   train:
@@ -32,10 +34,11 @@ services:
     depends_on:
       train:
         condition: service_completed_successfully
+    restart: unless-stopped
     ports:
       - "8000:8000"
     volumes:
-      - ./mlruns:/app/mlruns
+      - ./mlruns:/app/mlruns:ro  # serving only reads the registry
 
   score:
     image: credit-default-train:latest

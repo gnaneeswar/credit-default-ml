@@ -69,12 +69,33 @@ def _confusion_png(cm: np.ndarray, threshold: float, path: Path) -> None:
     plt.close(fig)
 
 
+def _native_importance(est, names: list[str]) -> tuple[np.ndarray, str]:
+    """The model's own importance, in a comparable unit per family, normalised to sum 1.
+
+    LightGBM's and XGBoost's default ``feature_importances_`` differ (LightGBM: *split
+    counts*, which favour continuous features with many thresholds regardless of loss
+    reduction), so both boosters are read explicitly as *total gain*.
+    """
+    kind = type(est).__name__
+    if kind == "LGBMClassifier":
+        raw, label = est.booster_.feature_importance(importance_type="gain"), "total gain"
+    elif kind == "XGBClassifier":
+        score = est.get_booster().get_score(importance_type="total_gain")
+        raw, label = np.array([score.get(n, 0.0) for n in names]), "total gain"
+    elif hasattr(est, "feature_importances_"):
+        raw, label = est.feature_importances_, "impurity (MDI)"
+    else:
+        raw, label = np.abs(np.ravel(est.coef_)), "|coefficient|"
+    raw = np.asarray(raw, dtype=float)
+    return raw / raw.sum() if raw.sum() > 0 else raw, label
+
+
 def feature_importance(model) -> pd.DataFrame:
     """Per-feature importance of the champion from the fitted model itself (no extra cost):
-    impurity-based MDI for tree ensembles, |coefficient| for logistic regression.
+    total gain for LightGBM / XGBoost, impurity MDI for random forest, |coefficient| for LR.
 
-    MDI is computed on training data and favours continuous / correlated features, so it is
-    paired with the holdout *group* permutation importance below, which is the robust,
+    These are computed on training data and favour continuous / correlated features, so they
+    are paired with the holdout *group* permutation importance below, which is the robust,
     model-agnostic measure.
     """
     from src.data.schema import RAW_FEATURE_GROUPS
@@ -83,10 +104,7 @@ def feature_importance(model) -> pd.DataFrame:
     raw_group = {f: g for g, feats, _ in RAW_FEATURE_GROUPS for f in feats}
     est = model[-1]
     names = [str(c) for c in model[:-1].get_feature_names_out()]
-    if hasattr(est, "feature_importances_"):
-        native, native_type = np.asarray(est.feature_importances_), "impurity (MDI)"
-    else:
-        native, native_type = np.abs(np.ravel(est.coef_)), "|coefficient|"
+    native, native_type = _native_importance(est, names)
     base = [n.removeprefix("WOE_") for n in names]
     out = pd.DataFrame(
         {

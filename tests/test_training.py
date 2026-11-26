@@ -231,3 +231,19 @@ def test_every_family_serialises_within_the_allowlist(small_xy, family: str) -> 
     if "model__n_estimators" in pipe.get_params():
         pipe.set_params(model__n_estimators=5)
     trusted_types(pipe.fit(X, y))  # raises if any persisted type is not allowlisted
+
+
+@pytest.mark.parametrize(
+    ("family", "label"),
+    [("lightgbm", "total gain"), ("xgboost", "total gain"), ("random_forest", "impurity (MDI)")],
+)
+def test_native_importance_is_comparable_across_families(small_xy, family, label) -> None:
+    """LightGBM's default importances are split COUNTS; the report must use gain instead."""
+    from src.training.evaluate import feature_importance
+
+    X, y = small_xy
+    pipe = MODEL_SPECS[family].build(Settings(), 3.5).set_params(model__n_estimators=20)
+    fi = feature_importance(pipe.fit(X, y))
+    assert fi["importance_type"].iloc[0] == label
+    assert fi["importance"].sum() == pytest.approx(1.0)
+    assert fi["importance"].between(0, 1).all()

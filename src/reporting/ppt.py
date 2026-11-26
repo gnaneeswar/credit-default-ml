@@ -249,13 +249,19 @@ def _fmt_params(params: dict) -> str:
     return ", ".join(f"{k}={v(val)}" for k, val in params.items())
 
 
+def _ranked(cv: pd.DataFrame) -> pd.DataFrame:
+    """Families in selection order: OOF F1 at each family's own cutoff (the deployed metric);
+    older artifacts without that column fall back to CV F1@0.5."""
+    key = "oof_f1_tuned" if "oof_f1_tuned" in cv.columns else "cv_f1"
+    return cv.sort_values(key, ascending=False).reset_index(drop=True)
+
+
 def _champion(inp: dict) -> dict:
-    cv = inp["cv"].sort_values("cv_f1", ascending=False).iloc[0]
+    cv = _ranked(inp["cv"]).iloc[0]
     names = _display_names(inp["grids"])
     return {"name": cv["model"], "display": names.get(cv["model"], cv["model"]), "cv": cv}
 
 
-# --------------------------------------------------------------------------- slides
 def _cover(prs, inp: dict) -> None:
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     slide.background.fill.solid()
@@ -285,9 +291,14 @@ def _cover(prs, inp: dict) -> None:
         f"{sh['full'][0]:,} accounts · {sh['full'][1] - 1} canonical features · "
         f"{tb['default_rate_full']:.1%} default rate",
         f"80/20 stratified split: {sh['train'][0]:,} train / {sh['test'][0]:,} holdout "
-        "(random_state = 42)",
-        f"Champion: {champ['display']} — CV F1 {champ['cv']['cv_f1']:.3f} ± "
-        f"{champ['cv']['cv_f1_std']:.3f} (3-fold stratified CV)",
+        f"(random_state = {inp['grids']['cv']['random_state']})",
+        (
+            f"Champion: {champ['display']} — OOF F1 {champ['cv']['oof_f1_tuned']:.3f} at its own "
+            f"cutoff (selection metric; 3-fold stratified CV)"
+            if "oof_f1_tuned" in champ["cv"]
+            else f"Champion: {champ['display']} — CV F1 {champ['cv']['cv_f1']:.3f} ± "
+            f"{champ['cv']['cv_f1_std']:.3f} (3-fold stratified CV)"
+        ),
         f"Holdout F1 {test['f1']:.3f} · ROC-AUC {test['roc_auc']:.3f} at threshold "
         f"{test['threshold']:.3f} (flag riskiest {oof['top_percent_flagged']}%)",
         "Leak-free sklearn pipelines · MLflow Registry @champion · FastAPI · Evidently",
@@ -364,6 +375,12 @@ def _eda_slide(prs, inp: dict) -> None:
     )
 
 
+def _importance_label(kind: str) -> str:
+    return {"impurity (MDI)": "MDI", "total gain": "Gain", "|coefficient|": "|coef|"}.get(
+        kind, "Importance"
+    )
+
+
 def _compact(names: list[str]) -> str:
     """'UTIL_1'..'UTIL_6' -> 'UTIL_1–6'; other names unchanged, order preserved."""
     import re
@@ -402,16 +419,18 @@ def _prep_slide(prs, inp: dict) -> None:
     pay = {int(k): v for k, v in counts["PAY_1"].items()}
     min_limit = eda["numeric_distributions"]["LIMIT_BAL"]["min"]
     split = f"{sh['train'][0]:,} / {sh['test'][0]:,}"
+    seed = inp["grids"]["cv"]["random_state"]
     bullets = [
         f"Validation on load: {cols_n} canonical features + target checked; ID dropped; "
         "UCI X1..X23 / Y renamed (PAY_0 → PAY_1)",
         f"Missing values: {eda['total_missing']} across all {rows_n:,} rows × {cols_n} "
         "features → no imputation needed",
         "Serving never imputes silently: null / NaN / non-numeric inputs get HTTP 422",
-        "Defensive fallback: WoE maps missing or unseen values to WoE 0 (neutral)",
+        "Out-of-contract values (LIMIT_BAL < 1, codes outside their range, |amount| > 1e9) "
+        "are rejected with HTTP 422 before scoring",
         "All inputs cast to float64; every fitted step lives inside the sklearn Pipeline "
         "and is re-fitted per CV fold (leak-free)",
-        f"Stratified 80/20 split ({split}, random_state = 42); 3-fold StratifiedKFold "
+        f"Stratified 80/20 split ({split}, random_state = {seed}); 3-fold StratifiedKFold "
         "inside the training split",
     ]
     left_w = 5.3
@@ -506,7 +525,7 @@ def _selection_slide(prs, inp: dict) -> None:
     reg = {
         **{
             k: champ_spec["fixed_params"][k]
-            for k in ("max_features", "max_samples")
+            for k in ("max_features", "max_samples", "subsample", "colsample_bytree")
             if k in champ_spec["fixed_params"]
         },
         **best,
@@ -565,7 +584,7 @@ def _selection_slide(prs, inp: dict) -> None:
     _textbox(
         slide,
         Box(x_r, TOP, w_r, 0.4),
-        [f"Top 12 features — {'MDI' if 'MDI' in kind else '|coef|'}"],
+        [f"Top 12 features — {_importance_label(kind)}"],
         NOTE_PT,
         NAVY,
         "label:features",
@@ -583,7 +602,7 @@ def _selection_slide(prs, inp: dict) -> None:
     _table(
         slide,
         Box(x_r, TOP + 0.45, w_r, BOTTOM - TOP - 0.45),
-        ["#", "Feature", "Type", "MDI" if "MDI" in kind else "|coef|"],
+        ["#", "Feature", "Type", _importance_label(kind)],
         frows,
         [0.4, 1.83, 0.55, w_r - 2.78],
         "table:feature_importance",
@@ -643,7 +662,8 @@ def _top3_slide(prs, inp: dict) -> None:
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     _title(slide, T["top3"])
     names = _display_names(inp["grids"])
-    cv = inp["cv"].sort_values("cv_f1", ascending=False).reset_index(drop=True)
+    cv = _ranked(inp["cv"])
+    tuned = "oof_f1_tuned" in cv.columns
     top3 = cv.head(3)
     rows = []
     for i, r in top3.iterrows():
@@ -652,6 +672,7 @@ def _top3_slide(prs, inp: dict) -> None:
                 str(i + 1),
                 names.get(r["model"], r["model"]),
                 _fmt_params(json.loads(r["best_params"])),
+                *([f"{r['oof_f1_tuned']:.4f} @ {r['oof_threshold']:.3f}"] if tuned else []),
                 f"{r['cv_f1']:.4f} ± {r['cv_f1_std']:.4f}",
                 f"{r['cv_roc_auc']:.4f}",
                 f"{r['cv_pr_auc']:.4f}",
@@ -659,42 +680,46 @@ def _top3_slide(prs, inp: dict) -> None:
                 f"{r['cv_recall']:.4f}",
             ]
         )
+    metrics = ["CV F1@0.5 (± std)", "ROC-AUC", "PR-AUC", "Precision", "Recall"]
+    if tuned:
+        header = ["Rank", "Model", "Selected hyperparameters", "OOF F1 @ own cutoff", *metrics]
+        widths = [0.6, 1.45, 2.883, 1.75, 1.75, 0.95, 0.95, 1.0, 1.0]
+    else:
+        header = ["Rank", "Model", "Selected hyperparameters", *metrics]
+        widths = [0.6, 1.45, 3.35, 1.9, 1.2, 1.2, 1.3, 1.333]
     h = _table(
         slide,
         Box(MARGIN, TOP, CONTENT_W, 3.6),
-        [
-            "Rank",
-            "Model",
-            "Selected hyperparameters",
-            "CV F1 (mean ± std)",
-            "ROC-AUC",
-            "PR-AUC",
-            "Precision",
-            "Recall",
-        ],
+        header,
         rows,
-        [0.7, 1.8, 3.2, 1.9, 1.15, 1.15, 1.2, 1.233],
+        widths,
         "table:top3",
         highlight=0,
         align_right_from=3,
     )
-    spread = top3["cv_f1"].iloc[0] - top3["cv_f1"].iloc[-1]
     rest = cv.iloc[3:]
-    notes = [
-        f"Champion: {names.get(top3['model'].iloc[0])} — highest mean CV F1; the top 3 lie "
-        f"within {spread:.4f} F1 (≈ {spread / top3['cv_f1_std'].iloc[0]:.1f}× the champion's "
-        "fold std), so they are close to tied",
-        "Selection metric = CV F1 at the default 0.5 cutoff on class-weighted models; the "
-        "operating threshold is then tuned separately on out-of-fold predictions",
-    ]
+    if tuned:
+        spread = top3["oof_f1_tuned"].iloc[0] - top3["oof_f1_tuned"].iloc[-1]
+        notes = [
+            f"Champion: {names.get(top3['model'].iloc[0])} — highest out-of-fold F1 at its own "
+            f"tuned cutoff, the metric that is actually deployed; the top 3 lie within "
+            f"{spread:.4f} F1, i.e. statistically tied",
+            "CV F1@0.5 is not comparable across families: each handles class imbalance "
+            "differently, so 0.5 sits at a different point of each precision/recall curve",
+            "Caveat: the same 3 folds tune hyperparameters, the cutoff and the family, so OOF F1 "
+            "is mildly optimistic; the untouched holdout gives the unbiased estimate",
+        ]
+    else:
+        notes = ["Champion: highest mean CV F1 at the default 0.5 cutoff"]
     if len(rest):
+        col = "oof_f1_tuned" if tuned else "cv_f1"
         notes.append(
             f"Not in top 3: {', '.join(names.get(m, m) for m in rest['model'])} "
-            f"(CV F1 {rest['cv_f1'].max():.4f})"
+            f"({'OOF F1' if tuned else 'CV F1'} {rest[col].max():.4f})"
         )
     y = TOP + h + 0.35
     _textbox(
-        slide, Box(MARGIN, y, CONTENT_W, BOTTOM - y), notes, BODY_PT, SLATE, "notes", bullets=True
+        slide, Box(MARGIN, y, CONTENT_W, BOTTOM - y), notes, NOTE_PT, SLATE, "notes", bullets=True
     )
 
 
