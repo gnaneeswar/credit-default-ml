@@ -546,7 +546,7 @@ If your UID is not 1000, use `HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose
 repo inside the Linux filesystem (e.g. `~/projects`), **not** under `/mnt/c` on WSL2, where
 SQLite locking and UID mapping on bind mounts break.
 
-Batch-score the holdout and check the API (in a second terminal):
+Batch-score the holdout and check the API (in a **second** terminal):
 
 ```bash
 docker compose --profile score run --rm --no-deps score
@@ -581,7 +581,7 @@ docker tag ghcr.io/gnaneeswar/credit-default-serve:latest credit-default-serve:l
 docker compose up --no-build
 ```
 
-In a second terminal, from the same folder:
+In a **second** terminal, from the same folder:
 
 ```bash
 docker compose --profile score run --rm --no-deps score
@@ -607,7 +607,7 @@ docker tag ghcr.io/gnaneeswar/credit-default-serve:latest credit-default-serve:l
 docker compose up --no-build
 ```
 
-In a second PowerShell window, from the same folder:
+In a **second** PowerShell window, from the same folder:
 
 ```powershell
 docker compose --profile score run --rm --no-deps score
