@@ -569,7 +569,7 @@ the names that `docker-compose.yml` uses, and `--no-build` makes compose use the
 #### Linux / macOS (Bash / Zsh)
 
 ```bash
-mkdir -p credit-default-ml/mlruns credit-default-ml/artifacts && cd credit-default-ml
+mkdir -p credit-default-ml && cd credit-default-ml
 curl -fsSLO https://raw.githubusercontent.com/gnaneeswar/credit-default-ml/main/docker-compose.yml
 curl -fsSLO https://raw.githubusercontent.com/gnaneeswar/credit-default-ml/main/sample_request.json
 
@@ -593,7 +593,7 @@ curl -s -X POST localhost:8000/invocations \
 #### Windows (PowerShell)
 
 ```powershell
-New-Item -ItemType Directory -Force -Path credit-default-ml, credit-default-ml\mlruns, credit-default-ml\artifacts | Out-Null
+New-Item -ItemType Directory -Force -Path credit-default-ml | Out-Null
 Set-Location credit-default-ml
 $base = "https://raw.githubusercontent.com/gnaneeswar/credit-default-ml/main"
 Invoke-WebRequest -UseBasicParsing "$base/docker-compose.yml" -OutFile docker-compose.yml
@@ -782,7 +782,11 @@ docker rm -f credit-default-serve                       # sequential path
 docker rmi credit-default-train credit-default-serve
 docker rmi ghcr.io/gnaneeswar/credit-default-train:latest \
            ghcr.io/gnaneeswar/credit-default-serve:latest   # pre-built image path
-git clean -fdX mlruns artifacts                         # delete generated outputs, keep .gitkeep
+git clean -fdX mlruns artifacts      # cloned repo (Options A / C): delete generated outputs, keep .gitkeep
+
+# pre-built images (Option B): run `docker compose down` inside the folder first, then from its parent
+rm -rf credit-default-ml                                # Linux / macOS
+# Remove-Item -Recurse -Force credit-default-ml         # Windows PowerShell
 ```
 
 Clear `mlruns` before switching between a host (`uv run`) and a Docker training run, because
