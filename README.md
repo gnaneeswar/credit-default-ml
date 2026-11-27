@@ -9,7 +9,8 @@ the winner as `models:/credit-default-pipeline@champion` in a SQLite MLflow regi
 that it evaluates the champion on a 20% holdout, runs Evidently drift monitoring, and
 generates an 8-slide interview deck (`artifacts/credit_default_summary.pptx`).
 `Dockerfile.serve` loads that champion into **FastAPI**. On a 12-core laptop (WSL2) the
-pipeline takes about **37–44 s** on the host and the training container about 45–60 s end to end.
+pipeline takes about **40–70 s** on the host and the training container about 50–75 s end to end,
+depending on CPU/RAM load.
 
 ```bash
 git clone https://github.com/gnaneeswar/credit-default-ml.git && cd credit-default-ml
@@ -119,9 +120,9 @@ actually deployed:
 | **LightGBM** ✅ champion | **0.5475** | 0.520 | 0.544 ± 0.008 | 0.785 | 0.560 |
 | XGBoost | 0.5473 | 0.581 | 0.543 ± 0.006 | 0.789 | 0.563 |
 | Random Forest | 0.5472 | 0.530 | 0.546 ± 0.008 | 0.787 | 0.555 |
-| Logistic Regression (WoE/IV) | 0.5424 | 0.592 | 0.535 ± 0.010 | 0.780 | 0.539 |
+| Logistic Regression (WoE/IV) | 0.5424 | 0.592 | 0.534 ± 0.010 | 0.780 | 0.539 |
 
-The top three are **tied** within 0.0003 OOF F1, far less than the fold standard deviation
+The top three are **tied** within 0.0002 OOF F1, far less than the fold standard deviation
 (about 0.007). Ranked by F1@0.5 instead, the random forest would have won; §4.4 explains
 why that metric isn't comparable across families. The champion's settings are LightGBM with
 `num_leaves=31` and `learning_rate=0.05`.
@@ -138,11 +139,11 @@ and on the holdout below.
 | default 0.5 (reference) | 0.539 | 0.470 | 0.632 | 0.761 | 0.778 | 0.561 | 29.8% |
 
 Confusion at 0.520: the model catches **819 of 1,327 defaults** and flags 873 good clients
-(TN 3,800 · FP 873 · FN 508 · TP 819). The OOF F1 was 0.548 and the holdout F1 is 0.543, so
+(TN 3,800 · FP 873 · FN 508 · TP 819). The OOF F1 was 0.547 and the holdout F1 is 0.543, so
 the cutoff generalises.
 
-**Lift:** the riskiest 10% of clients default at 3.2× the base rate. The top 30% contain
-64% of all defaults.
+**Lift:** on the holdout, the riskiest 10% of clients default at 3.11× the base rate (3.16× on the
+training OOF scores). The top 30% contain 64.5% of all holdout defaults (63.8% OOF).
 
 **Holdout deciles on the training score bands** (`artifacts/test_decile_analysis.csv`). The
 training OOF decile cutoffs are applied unchanged to the 6,000 holdout scores, so each row
@@ -210,7 +211,7 @@ decision. Row counts are over the full data.
 
 | Column | Codes | Rows | Evidence | Decision |
 |---|---|---|---|---|
-| `EDUCATION` | 0, 5, 6 | 345 (1.2%) | train default rates 0–17%, close to code 4 "others" (6.2%), far from codes 1–3 (19–25%) | **remap to 4**: supported by the data |
+| `EDUCATION` | 0, 5, 6 | 345 (1.15%) | train default rates 0–17%, close to code 4 "others" (6.2%), far from codes 1–3 (19–25%) | **remap to 4**: supported by the data |
 | `MARRIAGE` | 0 | 54 (0.2%) | train default rate 10.6% vs 28.2% for code 3 | **remap to 3** on meaning (unknown ≈ "others"). The rates do *not* match; 54 rows are too few for a reliable level of their own |
 | `PAY_n` | −2, 0 | most common codes | `0` revolving (12.8%) and `−2` inactive (12.7%) default **less** than `−1` paid in full (16.6%) | **keep as distinct codes**: collapsing them into −1 would lose real signal |
 
@@ -260,8 +261,8 @@ near-duplicate columns.
 
 | Signal | Features | Logic | Default rate (any month) |
 |---|---|---|---|
-| Credit balance (low risk) | `HAS_CREDIT_BAL_1`, `N_CREDIT_BAL`, `MIN_CREDIT_BAL_RATIO` | `BILL_AMT_n < 0`; negative bills are never clipped | 16.5% |
-| Over limit (distress) | `OVER_LIMIT_1`, `N_OVER_LIMIT`, `MAX_OVER_LIMIT_EXCESS` | `BILL_AMT_n > LIMIT_BAL`; excess = `max(BILL − LIMIT, 0) / LIMIT` | 30.1% |
+| Credit balance (low risk) | `HAS_CREDIT_BAL_1`, `N_CREDIT_BAL`, `MIN_CREDIT_BAL_RATIO` | `BILL_AMT_n < 0`; negative bills are never clipped | 15.7% |
+| Over limit (distress) | `OVER_LIMIT_1`, `N_OVER_LIMIT`, `MAX_OVER_LIMIT_EXCESS` | `BILL_AMT_n > LIMIT_BAL`; excess = `max(BILL − LIMIT, 0) / LIMIT` | 30.4% |
 | Intra-cycle paydown (liquidity) | `PAYDOWN_1`, `N_PAYDOWN`, `MAX_PAYDOWN_EXCESS` | `PAY_AMT_n > BILL_AMT_n`; excess = `max(PAY − BILL, 0) / LIMIT` | 15.7% |
 | Implied spend | `SPEND_1`, `SPEND_MEAN_3`, `SPEND_MEAN_5` | `BILL_AMT_n − (BILL_AMT_(n+1) − PAY_AMT_n)`, divided by `LIMIT`; 3- and 5-month rolling means smooth calendar-month vs. statement-cutoff timing | — |
 
@@ -300,7 +301,7 @@ There is no recent flag for dormant → revolver, because `PAY_2 = −2 → PAY_
 
 **What IV says.**
 - **Raw bills vs engineered ratios.** Raw `BILL_AMT1–5` have IV 0.013–0.016 and are dropped.
-  `UTIL_*` reach 0.08–0.12, and `PAY_COVER_1` (0.24) beats raw `PAY_AMT1` (0.18).
+  `UTIL_*` reach 0.08–0.13, and `PAY_COVER_1` (0.24) beats raw `PAY_AMT1` (0.18).
 - **The trajectory features rank high.** `MAX_DELINQ_STREAK` 0.85, `N_STAGNANT` 0.48,
   `STAGNANT_RECENT` 0.38, `N_ROLL_FWD` and `MAX_ROLL_FWD_STEP` 0.30.
 - **Sparse flags fall below 0.02 for LR.** `OVER_LIMIT_1`, `N_CREDIT_BAL`, `CURED_RECENT`,
@@ -314,7 +315,7 @@ different questions:
 | Total importance: raw source shuffled **before** the pipeline | ΔAUC | | Conditional: engineered group shuffled **after** the pipeline | ΔAUC |
 |---|---|---|---|---|
 | Repayment status (`PAY_1..6`) | **0.160** | | Status counts | 0.058 |
-| Payments (`PAY_AMT*`) | 0.044 | | Utilisation | 0.014 |
+| Payments (`PAY_AMT*`) | 0.044 | | Utilisation | 0.013 |
 | Bill amounts (`BILL_AMT*`) | 0.029 | | Implied spend | 0.003 |
 | Credit limit | 0.016 | | Payment coverage | 0.003 |
 | Demographics | 0.006 | | Stagnation | 0.001 |
@@ -396,7 +397,7 @@ made because it is correct, not because it scores higher.
   `is_unbalance`, `scale_pos_weight`), which shifts its probabilities so that 0.5 is a
   sensible cutoff *for that model*. The LR grid shows the effect directly: weighted and
   unweighted LR rank clients equally well (**ROC-AUC 0.780 for both**), but without weights
-  F1 at 0.5 collapses to **0.46** (recall 0.35) instead of **0.535**. The trade-off is that
+  F1 at 0.5 collapses to **0.46** (recall 0.35) instead of **0.534**. The trade-off is that
   weighted models are not calibrated probabilities. That is acceptable because decisions use
   a tuned cutoff.
 * **Choosing between families: OOF F1 at each family's own cutoff.** The four families
@@ -406,7 +407,7 @@ made because it is correct, not because it scores higher.
   2. Each family gets its own threshold from its own OOF scores.
   3. The family with the highest OOF F1 at that cutoff wins.
 
-  LightGBM, XGBoost and the random forest are tied within 0.0003. **Caveat:** the same 3
+  LightGBM, XGBoost and the random forest are tied within 0.0002. **Caveat:** the same 3
   folds pick the hyperparameters, the cutoff and the family, so OOF F1 is mildly optimistic
   (a winner's curse). The untouched holdout is the unbiased estimate.
 * **Threshold: coarse-to-fine, with 0.5 as a candidate.**
@@ -504,7 +505,7 @@ made because it is correct, not because it scores higher.
 | float64 model signature | robust to clients sending `20000.0`; avoids MLflow's integer-schema pitfalls |
 | offline-first data | the CSV and dictionary are committed; `ucimlrepo` runs only on a cache miss or `--refresh` |
 | `pathlib` only, LF only | enforced by ruff `PTH` rules and `.gitattributes` / `.editorconfig` |
-| pipeline about 37–44 s on the host | MLflow start-up overlaps the searches in a background thread; `refit=False` searches plus one parallel batch with every family's OOF folds and full refit; Evidently workers pre-warmed while registration runs. Container start-up and exit add about 5 s, and the training container takes about 45–60 s depending on host load |
+| pipeline about 40–70 s on the host (12-core WSL2 reference) | MLflow start-up overlaps the searches in a background thread; `refit=False` searches plus one parallel batch with every family's OOF folds and full refit; Evidently workers pre-warmed while registration runs. Container start-up and exit add about 5 s, and the training container takes about 50–75 s depending on CPU/RAM load |
 | single-threaded serving | every estimator keeps `n_jobs=1`, and the registry enforces it before logging. A multi-threaded forest takes about 4× longer per row and spawns a thread pool per request inside uvicorn |
 | `PAY_0` → `PAY_1` | consistent 1–6 indexing across all three monthly families; the UCI name is recorded in `schema.UCI_ORIGINAL_NAMES` and the dictionary |
 | deck from artifacts only | every slide number is read from `artifacts/*.json` / `*.csv`; the build checks text fit and raises `LayoutError` instead of overflowing |
@@ -713,7 +714,7 @@ their absolute artifact roots differ. The pipeline refuses to mix them and says 
 * **Model artifact integrity.** Sign or hash the registered model and verify it at load
   time, on top of the skops allowlist.
 * **Per-feature permutation importance.** Measured at 7–9 s for 68 inputs, so it is left out
-  of the 45–60 s pipeline. Run it offline if per-feature attribution on held-out data is
+  of the 50–75 s pipeline. Run it offline if per-feature attribution on held-out data is
   needed.
 * **Duplicates across the split.** 35 duplicate feature rows (distinct customer IDs) may fall
   on both sides of the 80/20 split. That is too few to matter, but a grouped split would rule
