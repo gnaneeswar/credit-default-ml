@@ -531,7 +531,16 @@ belong to you. The containers run as your UID/GID, so the generated files do too
 folders are missing (e.g. a run without cloning), the one-shot `init-dirs` service creates them
 and hands them to the runtime UID before `train` starts, so Docker never leaves them root-owned.
 
+**Option A** (build from source) and **Option B** (pre-built images) are the primary workflows on
+Linux, macOS and Windows; Option B has dedicated Bash/Zsh and PowerShell steps. **Option C**, a
+sequential `docker build` / `docker run` variant for POSIX shells (Linux, macOS or WSL2), is
+collapsed below.
+
 ### Option A — Build & Run End-to-End from Source
+
+The commands below are a Linux / POSIX shell guide (Bash or Zsh on Linux, macOS or WSL2). On
+Windows PowerShell, use [Option B](#option-b--run-using-pre-built-multi-architecture-images-no-git-clone-needed),
+which has PowerShell-ready commands.
 
 ```bash
 git clone https://github.com/gnaneeswar/credit-default-ml.git && cd credit-default-ml
@@ -616,6 +625,9 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8000/invocations `
   -ContentType 'application/json' -InFile sample_request.json | ConvertTo-Json -Depth 5
 ```
 
+<details>
+<summary>Option C — sequential <code>docker build</code> / <code>docker run</code> (Linux, macOS, or WSL2 terminal only)</summary>
+
 ### Option C — sequential `docker build` / `docker run`
 
 ```bash
@@ -643,6 +655,8 @@ docker run --rm --network host -u "$(id -u):$(id -g)" -v "$PWD/artifacts:/app/ar
 
 Re-running training registers a new version and moves `@champion` to it. Restart `serve`
 to load it.
+
+</details>
 
 ### Building & Publishing Multi-Platform Images
 
