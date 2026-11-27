@@ -50,7 +50,7 @@ The two kinds of error cost different things:
 | **False positive** (good client flagged) | credit friction | lost revenue, churn, complaints |
 | **False negative** (defaulter missed) | missed default | charge-off loss |
 
-**About 22% of clients default** (imbalanced data set) (3.5 non-defaulters per defaulter). Accuracy would therefore
+**About 22% of clients default** (imbalanced data set; 3.5 non-defaulters per defaulter). Accuracy would therefore
 reward a model that flags nobody, so the pipeline **selects on F1**. It reports ROC-AUC,
 PR-AUC, precision and recall alongside, and makes the cut-off an **explicit, registered
 decision** instead of a hidden 0.5.
