@@ -1,8 +1,13 @@
-# docker compose up --build
-#   1. train : trains, evaluates and registers @champion into ./mlruns (then exits 0)
-#   2. serve : starts only after train completed successfully; serves on :8000
+# docker compose up --build            (from a clone: builds both images)
+# docker compose up --no-build         (zero-clone: pre-built ghcr.io images tagged locally)
+#   0. init-dirs : creates ./mlruns and ./artifacts if missing (Docker would make them
+#                  root-owned) and hands them to the runtime user, then exits 0
+#   1. train     : trains, evaluates and registers @champion into ./mlruns (then exits 0)
+#   2. serve     : starts only after train completed successfully; serves on :8000
 # Optional batch scoring against the running API:
 #   docker compose --profile score run --rm --no-deps score
+#
+# No platform is pinned: Docker uses the host's native linux/amd64 or linux/arm64.
 #
 # Containers run as your host user so files written to ./mlruns and ./artifacts stay yours.
 # Defaults to 1000:1000; otherwise run:
@@ -13,13 +18,31 @@ name: credit-default-ml
 x-runtime-user: &runtime-user "${HOST_UID:-1000}:${HOST_GID:-1000}"
 
 services:
-  train:
-    build:
+  init-dirs:
+    build: &train-build
       context: .
       dockerfile: Dockerfile.train
     image: credit-default-train:latest
-    platform: linux/amd64
+    user: "0:0"
+    # chown may be unsupported on some Docker Desktop mounts; train then reports any real problem.
+    command:
+      - sh
+      - -c
+      - >-
+        mkdir -p /app/mlruns /app/artifacts &&
+        chown -R ${HOST_UID:-1000}:${HOST_GID:-1000} /app/mlruns /app/artifacts ||
+        echo 'init-dirs: chown not supported on this mount; continuing'
+    volumes:
+      - ./mlruns:/app/mlruns
+      - ./artifacts:/app/artifacts
+
+  train:
+    build: *train-build
+    image: credit-default-train:latest
     user: *runtime-user
+    depends_on:
+      init-dirs:
+        condition: service_completed_successfully
     volumes:
       - ./mlruns:/app/mlruns
       - ./artifacts:/app/artifacts
@@ -29,7 +52,6 @@ services:
       context: .
       dockerfile: Dockerfile.serve
     image: credit-default-serve:latest
-    platform: linux/amd64
     user: *runtime-user
     depends_on:
       train:
@@ -42,7 +64,6 @@ services:
 
   score:
     image: credit-default-train:latest
-    platform: linux/amd64
     user: *runtime-user
     profiles: ["score"]
     command: ["python", "-m", "src.inference.batch_client", "--url", "http://serve:8000"]

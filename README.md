@@ -7,7 +7,7 @@ UCI *Default of Credit Card Clients* dataset (id 350, Taiwan 2005, 30,000 client
 with leak-free 3-fold CV, picks a decision threshold from out-of-fold deciles, and registers
 the winner as `models:/credit-default-pipeline@champion` in a SQLite MLflow registry. After
 that it evaluates the champion on a 20% holdout, runs Evidently drift monitoring, and
-generates an 8-slide interview deck (`artifacts/credit_default_summary.pptx`).
+generates an 8-slide review deck (`artifacts/credit_default_summary.pptx`).
 `Dockerfile.serve` loads that champion into **FastAPI**. On a 12-core laptop (WSL2) the
 pipeline takes about **40–70 s** on the host and the training container about 50–75 s end to end,
 depending on CPU/RAM load.
@@ -194,7 +194,7 @@ usual 0.1 "stable" threshold. Monitoring reuses this score-band PSI for predicti
 | `src/training` | model specs/grids, tuning, OOF threshold, registry, holdout eval, orchestrator | train |
 | `src/inference` | FastAPI app, request schemas, batch client — **no imports from training/data** | train + serve |
 | `src/monitoring` | Evidently scenarios, reports, alerts | train |
-| `src/reporting` | interview deck built from `artifacts/` (python-pptx) | train |
+| `src/reporting` | review deck built from `artifacts/` (python-pptx) | train |
 
 The pipeline's stages are `ingest → eda → train → evaluate → monitor → report`. Running
 `python -m src.training.run` runs them all by default; `--stages`/`--models` select a subset.
@@ -513,10 +513,11 @@ made because it is correct, not because it scores higher.
 
 ## 5. Prerequisites
 
-* Linux `amd64` (or WSL2) with **Docker Engine ≥ 24** and the **compose plugin**. No Docker
-  Desktop is needed.
-* Internet access only to pull the base images (`python:3.12-slim-bookworm`, `ghcr.io/astral-sh/uv`).
-  The dataset is in the repo.
+* **Docker Engine ≥ 24** with the **Docker Compose plugin**. The images run natively on
+  `linux/amd64` (Linux, Windows/WSL2) and `linux/arm64` (Apple Silicon). Docker Desktop works on
+  macOS and Windows; on Linux or WSL2, Docker Engine alone is enough.
+* Internet access only to pull the base images (`python:3.12-slim-bookworm`, `ghcr.io/astral-sh/uv`),
+  or the pre-built images from `ghcr.io` for Option B. The dataset is in the repo.
 * About 2.5 GB of disk: the two images share their base and dependency layers.
 * About 3 GB of RAM at peak during training (one CV worker per core; less on fewer cores).
   The API uses about 300 MB.
@@ -526,11 +527,14 @@ made because it is correct, not because it scores higher.
 ## 6. Run with Docker
 
 `mlruns/` and `artifacts/` are committed as empty folders (`.gitkeep`), so the bind mounts
-belong to you. The containers run as your UID/GID, so the generated files do too.
+belong to you. The containers run as your UID/GID, so the generated files do too. If the
+folders are missing (e.g. a run without cloning), the one-shot `init-dirs` service creates them
+and hands them to the runtime UID before `train` starts, so Docker never leaves them root-owned.
 
-### Option A — docker compose (recommended)
+### Option A — Build & Run End-to-End from Source
 
 ```bash
+git clone https://github.com/gnaneeswar/credit-default-ml.git && cd credit-default-ml
 docker compose up --build
 ```
 
@@ -542,26 +546,90 @@ If your UID is not 1000, use `HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose
 repo inside the Linux filesystem (e.g. `~/projects`), **not** under `/mnt/c` on WSL2, where
 SQLite locking and UID mapping on bind mounts break.
 
-Batch-score the holdout against the running service (in a second terminal):
+Batch-score the holdout and check the API (in a second terminal):
 
 ```bash
 docker compose --profile score run --rm --no-deps score
+curl -s localhost:8000/health
+curl -s -X POST localhost:8000/invocations \
+     -H 'Content-Type: application/json' -d @sample_request.json
 ```
 
-### Option B — sequential `docker build` / `docker run`
+### Option B — Run Using Pre-Built Multi-Architecture Images (No Git Clone Needed)
+
+Both images are public on GitHub Container Registry for `linux/amd64` and `linux/arm64`, so
+Docker pulls the variant that matches your machine:
+
+* `ghcr.io/gnaneeswar/credit-default-train:latest` (used by `init-dirs`, `train` and `score`)
+* `ghcr.io/gnaneeswar/credit-default-serve:latest`
+
+Only `docker-compose.yml` and `sample_request.json` are downloaded. The images are re-tagged to
+the names that `docker-compose.yml` uses, and `--no-build` makes compose use them as they are.
+
+#### Linux / macOS (Bash / Zsh)
+
+```bash
+mkdir -p credit-default-ml/mlruns credit-default-ml/artifacts && cd credit-default-ml
+curl -fsSLO https://raw.githubusercontent.com/gnaneeswar/credit-default-ml/main/docker-compose.yml
+curl -fsSLO https://raw.githubusercontent.com/gnaneeswar/credit-default-ml/main/sample_request.json
+
+docker pull ghcr.io/gnaneeswar/credit-default-train:latest
+docker pull ghcr.io/gnaneeswar/credit-default-serve:latest
+docker tag ghcr.io/gnaneeswar/credit-default-train:latest credit-default-train:latest
+docker tag ghcr.io/gnaneeswar/credit-default-serve:latest credit-default-serve:latest
+
+docker compose up --no-build
+```
+
+In a second terminal, from the same folder:
+
+```bash
+docker compose --profile score run --rm --no-deps score
+curl -s localhost:8000/health
+curl -s -X POST localhost:8000/invocations \
+     -H 'Content-Type: application/json' -d @sample_request.json
+```
+
+#### Windows (PowerShell)
+
+```powershell
+New-Item -ItemType Directory -Force -Path credit-default-ml, credit-default-ml\mlruns, credit-default-ml\artifacts | Out-Null
+Set-Location credit-default-ml
+$base = "https://raw.githubusercontent.com/gnaneeswar/credit-default-ml/main"
+Invoke-WebRequest -UseBasicParsing "$base/docker-compose.yml" -OutFile docker-compose.yml
+Invoke-WebRequest -UseBasicParsing "$base/sample_request.json" -OutFile sample_request.json
+
+docker pull ghcr.io/gnaneeswar/credit-default-train:latest
+docker pull ghcr.io/gnaneeswar/credit-default-serve:latest
+docker tag ghcr.io/gnaneeswar/credit-default-train:latest credit-default-train:latest
+docker tag ghcr.io/gnaneeswar/credit-default-serve:latest credit-default-serve:latest
+
+docker compose up --no-build
+```
+
+In a second PowerShell window, from the same folder:
+
+```powershell
+docker compose --profile score run --rm --no-deps score
+Invoke-RestMethod http://localhost:8000/health
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/invocations `
+  -ContentType 'application/json' -InFile sample_request.json | ConvertTo-Json -Depth 5
+```
+
+### Option C — sequential `docker build` / `docker run`
 
 ```bash
 mkdir -p mlruns artifacts
 
 # 1) train, evaluate, register @champion  (writes ./mlruns and ./artifacts)
-docker build --platform linux/amd64 -f Dockerfile.train -t credit-default-train .
-docker run --rm --platform linux/amd64 -u "$(id -u):$(id -g)" \
+docker build -f Dockerfile.train -t credit-default-train .
+docker run --rm -u "$(id -u):$(id -g)" \
   -v "$PWD/mlruns:/app/mlruns" -v "$PWD/artifacts:/app/artifacts" \
   credit-default-train
 
 # 2) serve the registered champion on :8000
-docker build --platform linux/amd64 -f Dockerfile.serve -t credit-default-serve .
-docker run -d --name credit-default-serve --platform linux/amd64 -u "$(id -u):$(id -g)" \
+docker build -f Dockerfile.serve -t credit-default-serve .
+docker run -d --name credit-default-serve -u "$(id -u):$(id -g)" \
   -p 8000:8000 -v "$PWD/mlruns:/app/mlruns" \
   credit-default-serve
 
@@ -575,6 +643,27 @@ docker run --rm --network host -u "$(id -u):$(id -g)" -v "$PWD/artifacts:/app/ar
 
 Re-running training registers a new version and moves `@champion` to it. Restart `serve`
 to load it.
+
+### Building & Publishing Multi-Platform Images
+
+The `ghcr.io` images for Option B are built with `docker buildx` for both platforms. The
+Dockerfiles must not pin `FROM --platform=...`; otherwise every variant contains amd64 binaries.
+
+```bash
+# one-time: a builder that can produce multi-platform images
+docker buildx create --name multiarch --driver docker-container --use
+
+# standalone Docker Engine on Linux/WSL2 only (Docker Desktop ships QEMU already):
+docker run --privileged --rm tonistiigi/binfmt --install arm64
+
+# log in with a GitHub personal access token that has write:packages
+echo "$GHCR_TOKEN" | docker login ghcr.io -u <github-user> --password-stdin
+
+docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile.train \
+  -t ghcr.io/gnaneeswar/credit-default-train:latest --push .
+docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile.serve \
+  -t ghcr.io/gnaneeswar/credit-default-serve:latest --push .
+```
 
 ## 7. Verify the API
 
@@ -641,7 +730,7 @@ curl -s -X POST localhost:8000/invocations -H 'Content-Type: application/json' \
 | `artifacts/test_decile_analysis.csv` | holdout lift table on the **training** score bands, with band shares; `test_metrics.json` adds `score_psi_vs_train_bands` |
 | `artifacts/test_metrics.json`, `test_confusion_matrix.{json,png}` | holdout evaluation of `@champion` |
 | `artifacts/monitoring_report*.html`, `monitoring_summary.json` | Evidently reports and alert summary |
-| `artifacts/credit_default_summary.pptx` | **interview deck** (16:9, cover + 7 slides: EDA observations, data preprocessing and missing-value treatment, feature catalogue, feature selection and champion importance, candidate models and CV grids, top 3 models, Train OOF vs Holdout metrics with both decile tables), rebuilt from the artifacts on every run; `uv run python -m src.reporting.ppt` rebuilds it alone |
+| `artifacts/credit_default_summary.pptx` | **review deck** (16:9, cover + 7 slides: EDA observations, data preprocessing and missing-value treatment, feature catalogue, feature selection and champion importance, candidate models and CV grids, top 3 models, Train OOF vs Holdout metrics with both decile tables), rebuilt from the artifacts on every run; `uv run python -m src.reporting.ppt` rebuilds it alone |
 | `artifacts/feature_importance.csv`, `feature_group_importance.csv` | champion importance: per feature from the model (total gain for LightGBM / XGBoost, impurity MDI for random forest, \|coef\| for LR, normalised), and per feature group as holdout permutation ΔROC-AUC, either **total** (raw source through the pipeline) or **conditional** (engineered group) |
 | `artifacts/model_grids.json`, `train_oof_metrics.json` | deck inputs: model grids, imbalance handling and CV setup (generated from the model specs), and OOF metrics at the threshold |
 | `artifacts/batch_predictions.csv` | batch client output: actual vs predicted |
@@ -691,6 +780,8 @@ The test suite covers:
 docker compose down --rmi all --remove-orphans          # compose path
 docker rm -f credit-default-serve                       # sequential path
 docker rmi credit-default-train credit-default-serve
+docker rmi ghcr.io/gnaneeswar/credit-default-train:latest \
+           ghcr.io/gnaneeswar/credit-default-serve:latest   # pre-built image path
 git clean -fdX mlruns artifacts                         # delete generated outputs, keep .gitkeep
 ```
 

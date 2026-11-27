@@ -2,7 +2,7 @@
 # Training image: ingest -> EDA -> tune 4 models (3-fold CV) -> OOF threshold ->
 # register models:/credit-default-pipeline@champion -> holdout eval -> Evidently monitoring.
 # Self-contained: the cached UCI dataset is baked in, so it runs fully offline.
-FROM --platform=linux/amd64 python:3.12-slim-bookworm
+FROM python:3.12-slim-bookworm
 
 # Pinned uv, same version used to produce uv.lock locally.
 COPY --from=ghcr.io/astral-sh/uv:0.13.10 /uv /uvx /bin/
