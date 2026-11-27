@@ -6,7 +6,7 @@ UCI *Default of Credit Card Clients* dataset (id 350, Taiwan 2005, 30,000 client
 `Dockerfile.train` ingests the data and builds the EDA. It then tunes four model families
 with leak-free 3-fold CV, picks a decision threshold from out-of-fold deciles, and registers
 the winner as `models:/credit-default-pipeline@champion` in a SQLite MLflow registry. After
-that it evaluates the champion on a 20% holdout, runs Evidently drift monitoring, and
+that it evaluates the champion on 20% test data, runs Evidently drift monitoring, and
 generates an 8-slide review deck (`artifacts/credit_default_summary.pptx`).
 `Dockerfile.serve` loads that champion into **FastAPI**. On a 12-core laptop (WSL2) the
 pipeline takes about **40–70 s** on the host and the training container about 50–75 s end to end,
@@ -129,9 +129,9 @@ why that metric isn't comparable across families. The champion's settings are Li
 
 **Decision threshold:** 0.520, which means flagging the riskiest 27% of clients. The default
 0.5 was an explicit candidate. The tuned cutoff beats it on the OOF data (0.5475 vs 0.5442)
-and on the holdout below.
+and on the test data below.
 
-**Holdout** (6,000 clients the model never saw, scored by the *registered* `@champion`):
+**Test data** (6,000 clients the model never saw, scored by the *registered* `@champion`):
 
 | Cutoff | F1 | Precision | Recall | Accuracy | ROC-AUC | PR-AUC | Flagged |
 |---|---|---|---|---|---|---|---|
@@ -139,23 +139,23 @@ and on the holdout below.
 | default 0.5 (reference) | 0.539 | 0.470 | 0.632 | 0.761 | 0.778 | 0.561 | 29.8% |
 
 Confusion at 0.520: the model catches **819 of 1,327 defaults** and flags 873 good clients
-(TN 3,800 · FP 873 · FN 508 · TP 819). The OOF F1 was 0.547 and the holdout F1 is 0.543, so
+(TN 3,800 · FP 873 · FN 508 · TP 819). The OOF F1 was 0.547 and the test data F1 is 0.543, so
 the cutoff generalises.
 
-**Lift:** on the holdout, the riskiest 10% of clients default at 3.11× the base rate (3.16× on the
-training OOF scores). The top 30% contain 64.5% of all holdout defaults (63.8% OOF).
+**Lift:** on the test data, the riskiest 10% of clients default at 3.11× the base rate (3.16× on the
+training OOF scores). The top 30% contain 64.5% of all test data defaults (63.8% OOF).
 
-**Holdout deciles on the training score bands** (`artifacts/test_decile_analysis.csv`). The
-training OOF decile cutoffs are applied unchanged to the 6,000 holdout scores, so each row
+**Test data deciles on the training score bands** (`artifacts/test_decile_analysis.csv`). The
+training OOF decile cutoffs are applied unchanged to the 6,000 test data scores, so each row
 compares like for like with the training table:
 
-| Decile | Train bad rate | Holdout bad rate | Train cum. capture | Holdout cum. capture | Holdout share |
+| Decile | Train bad rate | Test data bad rate | Train cum. capture | Test data cum. capture | Test data share |
 |---|---|---|---|---|---|
 | 1 | 69.8% | 68.8% | 31.6% | 33.2% | 10.7% |
 | 3 (operating) | 27.6% | 26.0% | 63.8% | 64.5% | 10.4% |
 | 10 | 5.1% | 5.8% | 100% | 100% | 7.8% |
 
-The rank-ordering holds on unseen data. The holdout band shares stay within 7.8–11.3% (each
+The rank-ordering holds on unseen data. The test data band shares stay within 7.8–11.3% (each
 training band holds 10% by construction), giving a **score PSI of 0.009**, far below the
 usual 0.1 "stable" threshold. Monitoring reuses this score-band PSI for prediction drift.
 
@@ -163,7 +163,7 @@ usual 0.1 "stable" threshold. Monitoring reuses this score-band PSI for predicti
 
 | Batch | Drifted features | Score PSI | F1 (Δ) | Alerts |
 |---|---|---|---|---|
-| holdout | 0 / 23 | 0.009 | 0.543 (−0.005) | none |
+| test data | 0 / 23 | 0.009 | 0.543 (−0.005) | none |
 | simulated downturn (limits −40%, revolving / late statuses +1 month, bills +40%) | 13 / 23 | 0.751 | 0.451 (−0.096) | data drift + score drift + performance |
 | concept drift (30% of labels flipped) | 0 / 23 | 0.009 | 0.412 (−0.136) | performance only |
 
@@ -172,7 +172,7 @@ usual 0.1 "stable" threshold. Monitoring reuses this score-band PSI for predicti
 ```
                          ┌──────────────────────── Dockerfile.train ───────────────────────┐
  data/raw/*.csv ───────▶ │ ingest → EDA → GridSearchCV ×4 (3-fold) → OOF deciles/threshold │
- (committed, offline)    │        → log + register @champion → holdout eval → Evidently    │
+ (committed, offline)    │        → log + register @champion → test data eval → Evidently  │
                          └──────────────┬───────────────────────────────┬──────────────────┘
                                         │ writes                        │ writes
                                         ▼                               ▼
@@ -191,7 +191,7 @@ usual 0.1 "stable" threshold. Monitoring reuses this score-band PSI for predicti
 | `src/common` | `Path`-based settings, stage-aware stdout logging, tables, MLflow registry loader | train + serve |
 | `src/data` | schema/canonical names, offline ingest + data dictionary, stratified split, EDA | train |
 | `src/features` | `DomainCleaner`, `DomainFeatureEngineer`, `WoEIVSelector` (sklearn transformers) | train + serve |
-| `src/training` | model specs/grids, tuning, OOF threshold, registry, holdout eval, orchestrator | train |
+| `src/training` | model specs/grids, tuning, OOF threshold, registry, test data eval, orchestrator | train |
 | `src/inference` | FastAPI app, request schemas, batch client — **no imports from training/data** | train + serve |
 | `src/monitoring` | Evidently scenarios, reports, alerts | train |
 | `src/reporting` | review deck built from `artifacts/` (python-pptx) | train |
@@ -206,7 +206,7 @@ The training run prints a stage-timing table at the end.
 
 The EDA ([artifacts/eda_report.md](artifacts/eda_report.md), generated) checks every code
 that appears in the data but not in the UCI documentation. **Default rates come from the
-24,000-row training split only**, so the holdout's labels never informed a design
+24,000-row training split only**, so the test data's labels never informed a design
 decision. Row counts are over the full data.
 
 | Column | Codes | Rows | Evidence | Decision |
@@ -309,7 +309,7 @@ There is no recent flag for dormant → revolver, because `PAY_2 = −2 → PAY_
   The tree models still use them.
 
 **What the champion relies on** (`artifacts/feature_group_importance.csv`). This is
-permutation importance on the 6,000-row holdout, as the drop in ROC-AUC. It answers two
+permutation importance on the 6,000-row test data, as the drop in ROC-AUC. It answers two
 different questions:
 
 | Total importance: raw source shuffled **before** the pipeline | ΔAUC | | Conditional: engineered group shuffled **after** the pipeline | ΔAUC |
@@ -333,7 +333,7 @@ times larger.
 
 Per feature, the champion's own importance (**total gain**) ranks `N_DELINQ`, `MAX_DELINQ`
 and `PAY_1` first, then payments and utilisation. Gain is computed on training data and
-favours continuous features, so it is reported *alongside* the holdout group view. LightGBM's
+favours continuous features, so it is reported *alongside* the test data group view. LightGBM's
 default `feature_importances_` are split **counts**, not gain, so the code reads total gain
 explicitly for both boosters.
 
@@ -343,9 +343,9 @@ explicitly for both boosters.
 |---|---|---|---|
 | Champion (selection rule) | RF (CV F1@0.5) | RF (CV F1@0.5) | **LightGBM (OOF F1 @ own cutoff)** |
 | Champion CV F1@0.5 | 0.5460 | 0.5493 | 0.5442 |
-| Holdout F1 @ registered cutoff | 0.5379 | 0.5468 | 0.5426 |
-| Holdout precision / recall | 0.485 / 0.604 | 0.505 / 0.596 | 0.484 / 0.617 |
-| Holdout ROC-AUC / PR-AUC | 0.777 / 0.553 | 0.780 / 0.558 | 0.778 / **0.561** |
+| Test data F1 @ registered cutoff | 0.5379 | 0.5468 | 0.5426 |
+| Test data precision / recall | 0.485 / 0.604 | 0.505 / 0.596 | 0.484 / 0.617 |
+| Test data ROC-AUC / PR-AUC | 0.777 / 0.553 | 0.780 / 0.558 | 0.778 / **0.561** |
 
 The billing features gave a consistent, modest gain. The review fixes changed the
 methodology:
@@ -353,8 +353,8 @@ methodology:
 - 0.5 as an explicit threshold candidate;
 - history-only roll counts.
 
-Those changes trade 0.004 holdout F1 for higher recall and PR-AUC. Every change between
-columns is within the holdout's sampling error (about ±0.015). The methodology change was
+Those changes trade 0.004 test data F1 for higher recall and PR-AUC. Every change between
+columns is within the test data's sampling error (about ±0.015). The methodology change was
 made because it is correct, not because it scores higher.
 
 ### 4.3 Leak-free WoE/IV for Logistic Regression; raw features for trees
@@ -409,7 +409,7 @@ made because it is correct, not because it scores higher.
 
   LightGBM, XGBoost and the random forest are tied within 0.0002. **Caveat:** the same 3
   folds pick the hyperparameters, the cutoff and the family, so OOF F1 is mildly optimistic
-  (a winner's curse). The untouched holdout is the unbiased estimate.
+  (a winner's curse). The untouched test data is the unbiased estimate.
 * **Threshold: coarse-to-fine, with 0.5 as a candidate.**
   1. The OOF decile table ([artifacts/train_decile_analysis.csv](artifacts/train_decile_analysis.csv))
      shows bad rate, lift, cumulative capture, and the F1 you would get from flagging the
@@ -419,9 +419,9 @@ made because it is correct, not because it scores higher.
      0.5, so tuning is used only when it actually helps.
 
   Result: **flag the riskiest 27%, cutoff 0.520**. That gives OOF F1 0.5475 against 0.5442
-  at 0.5, and holdout F1 0.543 against 0.539.
+  at 0.5, and test data F1 0.543 against 0.539.
 * **Honest caveat:** the F1 curve is fairly flat around its peak (0.47–0.53). Differences of
-  a few thousandths sit inside the CV standard deviation (about 0.007) and the holdout's
+  a few thousandths sit inside the CV standard deviation (about 0.007) and the test data's
   sampling error (about ±0.015 with 1,327 defaults). I did **not** retune on the test set,
   which would leak it into the model. In production the cutoff should come from a cost
   matrix (loss per missed default vs. cost per false alarm). The pipeline makes it a single
@@ -459,8 +459,8 @@ made because it is correct, not because it scores higher.
   - **Every family is tested.** A test serialises each candidate family, so a
     family-specific type can't surface only on the day that family wins.
 * **One loader for evaluation, serving and monitoring.** All three call
-  `src.common.mlflow_utils.load_champion`. The holdout evaluation therefore tests the exact
-  code path the API uses: the batch client's F1 over HTTP matches the holdout evaluation
+  `src.common.mlflow_utils.load_champion`. The test data evaluation therefore tests the exact
+  code path the API uses: the batch client's F1 over HTTP matches the test data evaluation
   exactly.
 * **FastAPI service** (`src/inference`) has no imports from training, data, monitoring or
   reporting code. AST tests (which resolve relative imports) and a runtime test enforce
@@ -546,7 +546,7 @@ If your UID is not 1000, use `HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose
 repo inside the Linux filesystem (e.g. `~/projects`), **not** under `/mnt/c` on WSL2, where
 SQLite locking and UID mapping on bind mounts break.
 
-Batch-score the holdout and check the API (in a **second** terminal):
+Batch-score the test data and check the API (in a **second** terminal):
 
 ```bash
 docker compose --profile score run --rm --no-deps score
@@ -636,7 +636,7 @@ docker run -d --name credit-default-serve -u "$(id -u):$(id -g)" \
 # the model takes a few seconds to load: wait for the container healthcheck
 until [ "$(docker inspect -f '{{.State.Health.Status}}' credit-default-serve)" = healthy ]; do sleep 2; done
 
-# optional: batch-score the holdout through the API
+# optional: batch-score the test data through the API
 docker run --rm --network host -u "$(id -u):$(id -g)" -v "$PWD/artifacts:/app/artifacts" \
   credit-default-train python -m src.inference.batch_client --url http://localhost:8000
 ```
@@ -684,7 +684,7 @@ curl -s -X POST localhost:8000/invocations \
 #     "violations":[{"row":0,"column":"LIMIT_BAL","value":-5000.0,"rule":"credit limit: 1 .. 1e9"}]}}
 ```
 
-[`sample_request.json`](sample_request.json) holds three real holdout clients: a delinquent
+[`sample_request.json`](sample_request.json) holds three real test data clients: a delinquent
 defaulter (flagged), a revolving payer, and an inactive card. Interactive docs are at
 `http://localhost:8000/docs`.
 
@@ -727,11 +727,11 @@ curl -s -X POST localhost:8000/invocations -H 'Content-Type: application/json' \
 | `artifacts/cv_comparison.csv` | best candidate per model family (CV F1, ROC-AUC, PR-AUC, precision, recall) |
 | `artifacts/iv_table.csv` | WoE/IV ranking and selection |
 | `artifacts/train_decile_analysis.csv` | OOF decile lift, bad rate, capture and F1-at-cutoff table |
-| `artifacts/test_decile_analysis.csv` | holdout lift table on the **training** score bands, with band shares; `test_metrics.json` adds `score_psi_vs_train_bands` |
-| `artifacts/test_metrics.json`, `test_confusion_matrix.{json,png}` | holdout evaluation of `@champion` |
+| `artifacts/test_decile_analysis.csv` | test data lift table on the **training** score bands, with band shares; `test_metrics.json` adds `score_psi_vs_train_bands` |
+| `artifacts/test_metrics.json`, `test_confusion_matrix.{json,png}` | test data evaluation of `@champion` |
 | `artifacts/monitoring_report*.html`, `monitoring_summary.json` | Evidently reports and alert summary |
-| `artifacts/credit_default_summary.pptx` | **review deck** (16:9, cover + 7 slides: EDA observations, data preprocessing and missing-value treatment, feature catalogue, feature selection and champion importance, candidate models and CV grids, top 3 models, Train OOF vs Holdout metrics with both decile tables), rebuilt from the artifacts on every run; `uv run python -m src.reporting.ppt` rebuilds it alone |
-| `artifacts/feature_importance.csv`, `feature_group_importance.csv` | champion importance: per feature from the model (total gain for LightGBM / XGBoost, impurity MDI for random forest, \|coef\| for LR, normalised), and per feature group as holdout permutation ΔROC-AUC, either **total** (raw source through the pipeline) or **conditional** (engineered group) |
+| `artifacts/credit_default_summary.pptx` | **review deck** (16:9, cover + 7 slides: EDA observations, data preprocessing and missing-value treatment, feature catalogue, feature selection and champion importance, candidate models and CV grids, top 3 models, Train OOF vs Test data metrics with both decile tables), rebuilt from the artifacts on every run; `uv run python -m src.reporting.ppt` rebuilds it alone |
+| `artifacts/feature_importance.csv`, `feature_group_importance.csv` | champion importance: per feature from the model (total gain for LightGBM / XGBoost, impurity MDI for random forest, \|coef\| for LR, normalised), and per feature group as test data permutation ΔROC-AUC, either **total** (raw source through the pipeline) or **conditional** (engineered group) |
 | `artifacts/model_grids.json`, `train_oof_metrics.json` | deck inputs: model grids, imbalance handling and CV setup (generated from the model specs), and OOF metrics at the threshold |
 | `artifacts/batch_predictions.csv` | batch client output: actual vs predicted |
 | `mlruns/` | MLflow tracking database, model registry and artifacts |
